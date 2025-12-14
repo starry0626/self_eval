@@ -1,0 +1,6 @@
+{
+  "mean_inference_time": 30.144041538238525,
+  "std_inference_time": 5.783788688824428,
+  "total_inference_time": 120.5761661529541,
+  "samples_per_second": 0.03317405195091286
+}
