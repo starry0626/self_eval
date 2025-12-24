@@ -34,6 +34,8 @@ from transformers import (
     PreTrainedModel,
     PreTrainedTokenizerBase,
     Qwen2VLForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     Trainer,
     TrainerCallback,
     is_wandb_available,
@@ -143,7 +145,8 @@ class Qwen2VLGRPOTrainer(Trainer):
         peft_config ([`~peft.PeftConfig`], *optional*, defaults to `None`):
             PEFT configuration used to wrap the model. If `None`, the model is not wrapped.
     """
-
+    # 继承于transformers的trainer库
+    # 重写了损失函数的计算, 多模态数据的处理, 多模型的管理(参考模型)等功能
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
@@ -168,14 +171,19 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         # Models
         # Trained model
+        #模型的初始化参数
         model_init_kwargs = args.model_init_kwargs or {}
+        #设置attention的实现方式(flash_attention) !!!!!!!!可能需要进行npu适配
         model_init_kwargs["attn_implementation"] = attn_implementation
-        if isinstance(model, str):
+        if isinstance(model, str): #判断model是否为字符串
             model_id = model
+            # 设置参数格式 !!!!!!!!!!!!!!npu
             torch_dtype = model_init_kwargs.get("torch_dtype")
             if isinstance(torch_dtype, torch.dtype) or torch_dtype == "auto" or torch_dtype is None:
+                # 如果已经是torch.dtype的格式, 或者为自动处理或不指定, 则无需进行处理
                 pass  # torch_dtype is already a torch.dtype or "auto" or None
             elif isinstance(torch_dtype, str):  # it's a str, but not "auto"
+                # 如果为字符串则需要修改为对应的torch.dtype的格式
                 torch_dtype = getattr(torch, torch_dtype)
                 model_init_kwargs["torch_dtype"] = torch_dtype
             else:
@@ -183,18 +191,24 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "Invalid `torch_dtype` passed to `GRPOConfig`. Expected either 'auto' or a string representing "
                     f"a `torch.dtype` (e.g., 'float32'), but got {torch_dtype}."
                 )
-            # Disable caching if gradient checkpointing is enabled (not supported)
+            # 若开启梯度检查点则禁用KVcache(不支持) ???????????待详细了解
             model_init_kwargs["use_cache"] = (
                 False if args.gradient_checkpointing else model_init_kwargs.get("use_cache")
             )
+            # 加载模型, 对于特定的qwenvl模型要加载特定的模型类???????具体区别
             if "Qwen2-VL" in model_id:
                 model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            elif "Qwen2.5-VL" in model_id:
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+            elif "Qwen3-VL" in model_id:
+                self.ref_model = Qwen3VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             elif "Aria" in model_id:
                 model_init_kwargs.pop("use_cache")
                 model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             else:
                 model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
         else:
+            # 如果模型已经被加载
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
                 raise ValueError(
@@ -205,12 +219,17 @@ class Qwen2VLGRPOTrainer(Trainer):
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
-        # Reference model
+        # 加载参考模型(GRPO中计算KL散度的参考)
         if is_deepspeed_zero3_enabled():
+            # deepspeed_zero3会对模型参数进行切分, 我们需要加载一份完整的模型作为参考模型
             if "Qwen2-VL" in model_id:
                 self.ref_model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             elif "Aria" in model_id:
                 self.ref_model = AriaForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            elif "Qwen2.5-VL" in model_id:
+                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+            elif "Qwen3-VL" in model_id:
+                self.ref_model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             else:
                 self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         elif peft_config is None:
@@ -221,14 +240,17 @@ class Qwen2VLGRPOTrainer(Trainer):
             # to revert to the initial model.
             self.ref_model = None
 
-        # Processing class
+        # 加载processor ????????????
+        # processor似乎与加载模型时不同, 加载时只传入模型名即可, 加载后再修改参数. 还是说因为需要修改的参数少所以才这么做????????
         if processing_class is None:
-            if "Qwen2-VL" in model_id or "Aria" in model_id:
+            if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Qwen3-VL" in model_id or "Aria" in model_id:
                 processing_class = AutoProcessor.from_pretrained(model_id)
-                pad_token_id = processing_class.tokenizer.pad_token_id
-                processing_class.pad_token_id = pad_token_id
+                # 手动同步属性, 是否必须????????
+                # 将tokenlizer对应的pad_token与eos_token的id属性赋给processor
+                processing_class.pad_token_id = processing_class.tokenizer.pad_token_id
                 processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
-                if "Qwen2-VL" in model_id:
+                if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Qwen3-VL" in model_id:
+                    # 手动设置分辨率
                     processing_class.image_processor.max_pixels = max_pixels
                     processing_class.image_processor.min_pixels = min_pixels
             else:
@@ -245,7 +267,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 )
         self.reward_funcs = reward_funcs
 
-        # Reward processing class
+        # Reward processing class(使用模型作为奖励函数)
         if reward_processing_classes is None:
             reward_processing_classes = [None] * len(reward_funcs)
         elif not isinstance(reward_processing_classes, list):
@@ -355,16 +377,31 @@ class Qwen2VLGRPOTrainer(Trainer):
             self.processing_class.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
             for msg in prompts_messages
         ]
+        # qwen3-vl的兼容, 额外的metadata参数
+        if"Qwen3-VL" in model_id:
+            videos, video_metadatas = zip(*videos)
+            videos, video_metadata = list(videos), list(video_metadatas)
 
-        prompt_inputs = self.processing_class(
+            prompt_inputs = self.processing_class(
             text=texts,
             images=image_inputs,
-            videos=video_inputs,
+            videos=videos,
+            video_metadata=video_metadata,# 传入 fps, index等参数
             return_tensors="pt",
             padding=True,
             padding_side="left",
-            **video_kwargs # 传入 fps, duration 等参数
+            **video_kwargs 
         )
+        else:
+            prompt_inputs = self.processing_class(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                **video_kwargs # 传入 fps, duration 等参数
+            )
         
         # 准备 inputs (move to device)
         prompt_inputs = super()._prepare_inputs(prompt_inputs)
@@ -374,29 +411,33 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
 
-        # Generate completions
+        # 生成GRPO的采样
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             # prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)
 
             # Generate N times, each generate one with the temp_generation_config , stack the output_ids to prompt_completion_ids, pad the empty places with number 151613
             num_generations = self.generation_config.num_return_sequences
+            # copy一份num_return_sequences=1的配置, 每次只生成一份
+            # 为什么不能并行? 效率是否过低?
             temp_generation_config = copy.deepcopy(self.generation_config)
             temp_generation_config.num_return_sequences = 1
 
             all_completions = []
 
+            # 循环生成num_generations份回答
             for i in range(num_generations):  # -1 because we already have one generation
                 completion = unwrapped_model.generate(**prompt_inputs, generation_config=temp_generation_config)
                 all_completions.append(completion)
 
-            # Stack all completions and pad if needed
+            # 计算最大的回答长度
             max_length = max(completion.size(1) for completion in all_completions)
             padded_completions = []
-
+            # 填充长度较短的回答
             for completion in all_completions:
                 if completion.size(1) < max_length:
+
                     padding = torch.full(
-                        (completion.size(0), max_length - completion.size(1)),
+                        (completion.size(0), max_length - completion.size(1)), #(batch, 缺的部分)
                         self.processing_class.tokenizer.pad_token_id,
                         dtype=completion.dtype,
                         device=completion.device,
@@ -406,101 +447,88 @@ class Qwen2VLGRPOTrainer(Trainer):
                     padded_completion = completion
                 padded_completions.append(padded_completion)
 
-            # Stack all padded completions
+            # 在dim0拼接起来, 结果是(B * G, Sequence_Length).
+            # 顺序为[Batch1_Gen1, Batch2_Gen1, ..., Batch1_GenG, Batch2_GenG]
             prompt_completion_ids = torch.cat(padded_completions, dim=0)
 
-        prompt_length = prompt_inputs["input_ids"].size(1)
-        completion_ids = prompt_completion_ids[:, prompt_length:]
+        prompt_length = prompt_inputs["input_ids"].size(1) #计算prompt长度, 因为prompt_inputs是被padding过的, 所以所有batch长度一致
+        completion_ids = prompt_completion_ids[:, prompt_length:] #提取纯回答部分
 
         # --- 关键修改：处理 input tensors 的重复 (Replication) ---
         # GRPO 生成了 N 个样本，因此视觉特征(pixel_values等)需要重复 N 次以匹配 batch size
         
-        prompt_inputs.pop("input_ids")
-        prompt_inputs.pop("attention_mask")
+        # prompt_inputs本质上是一个tensor组成的字典
+        prompt_inputs.pop("input_ids") #去掉分词后的文本输入(包括视觉token占位符与文字时间戳)
+        prompt_inputs.pop("attention_mask") #去掉对padding的注意力掩码tensor ?????????
 
-        # 动态检测并重复所有视觉相关的 tensor (pixel_values, video_grid_thw 等)
-        # Qwen2/3-VL 的 processor 输出包含 videos, pixel_values_videos, video_grid_thw 等
-        for key in list(prompt_inputs.keys()):
-            val = prompt_inputs[key]
-            if isinstance(val, torch.Tensor):
-                # 假设 dim 0 是 batch size
-                # repeat_interleave 是正确的方式：[A, B] -> [A, A, B, B] (如果 num_generations=2)
-                # 注意：原始代码用了 repeat (整个块重复)，但通常我们需要 interleave 来匹配 prompt_completion_ids 的顺序
-                # 原始代码逻辑: prompts = [p1, p2], completions = [c1_1, c1_2, c2_1, c2_2] (如果生成是以此顺序)
-                # 检查 generate 循环：它是 循环 num_generations 次，每次生成整个 batch。
-                # 所以 completion 顺序是: [Batch_Gen1, Batch_Gen2, ...]
-                # 因此我们需要 repeat (整个 batch 重复)，而不是 interleave。
-                
-                prompt_inputs[key] = val.repeat(num_generations, *([1]*(val.dim()-1)))
-
-        # --- 之后计算 logps, KL, Rewards 的逻辑保持不变 ---
-        # ... (后续代码直到 return loss 保持不变) ...
 
         # Get the per-token log probabilities for the completions for the model and the reference model
         def get_per_token_logps(model, input_ids, **kwargs):
-            logits = model(input_ids, **kwargs).logits  # (B, L, V)
-            logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-            input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+            # input_ids传入模型的的输出prompt_completion_ids(本质上时token_id. padding, dim0为拼接后的batch和group)
+            # 剩余参数传入的是prompt_inputs
+            # .logits是模型输出层预测的未归一化的分数(batch(这里是batch*group), 序列长, 词表大小)
+            logits = model(input_ids, **kwargs).logits  #(B, L, V)
+            logits = logits[:, :-1, :]  # (B, L-1, V), 去掉最后一个词的概率, 这预测的是下一个词
+            input_ids = input_ids[:, 1:]  # (B, L-1), 预测出的每个词表内所有词的分数对应的应该取的那个词(训练模型采样出来的词)
             # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
             per_token_logps = []
+            # 遍历dim0, 逐个进行计算(防止爆显存)
             for logits_row, input_ids_row in zip(logits, input_ids):
-                log_probs = logits_row.log_softmax(dim=-1)
+                # logits_row(L-1, V), input_ids_row(V)
+                log_probs = logits_row.log_softmax(dim=-1) #最后一个维度转化为对数概率分布
+                # torch.gather()要求索引tensor与被收集tensor的维度数一致, 这里先通过unsqueeze给索引增加一个维度
+                # torch.gather() 作用的维度不会消失, 这里用squeeze(1)把多余的那个维度去掉, 最终维度(L-1)
                 token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
                 per_token_logps.append(token_log_prob)
-            return torch.stack(per_token_logps)
+            return torch.stack(per_token_logps)# (B, L-1)
 
-        prompt_inputs.pop("input_ids")
-        prompt_inputs.pop("attention_mask")
-        # Okay I am assuming that the inputs are Qwen2VL processor
-        # and no video for now, repeat the image for each completion
-        if "image" in inputs[0]:
-            prompt_inputs["pixel_values"] = prompt_inputs["pixel_values"].repeat(len(prompt_completion_ids), 1)
-            prompt_inputs["image_grid_thw"] = prompt_inputs["image_grid_thw"].repeat(len(prompt_completion_ids), 1)
-        # import pdb; pdb.set_trace()
-        
-        # XXX if input video
-        # image_grid_thw is from image_process_qwen2_vl
-        # https://github.com/huggingface/transformers/blob/dd16acb8a3e93b643aa374c9fb80749f5235c1a6/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py#L414
-        # automatic process
         if "video" in inputs[0]:
-            prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(len(prompt_completion_ids), 1)
-            prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
+            # 这里有问题, 视觉信息不应该复制len(prompt_completion_ids)=B*G份, 而只应该复制G份, 这使得代码只适配于batch=1的情况.
+            # prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(len(prompt_completion_ids), 1)
+            # prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)
+            prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(num_generations, 1)
+            prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(num_generations, 1)
         
         
         per_token_logps = get_per_token_logps(model, prompt_completion_ids, **prompt_inputs)
-        # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
+        # 去掉prompt, 只保留生成部分的概率
         per_token_logps = per_token_logps[:, prompt_length - 1 :]
 
         with torch.inference_mode():
+            # 计算参考模型的概率, 启动模型的推理模式以节省显存
             if self.ref_model is not None:
                 ref_per_token_logps = get_per_token_logps(self.ref_model, prompt_completion_ids, **prompt_inputs) # Fix Bug
             else:
                 with self.accelerator.unwrap_model(model).disable_adapter():
                     ref_per_token_logps = get_per_token_logps(model, prompt_completion_ids, **prompt_inputs) # Fix Bug
-        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+        ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :] # 去掉prompt, 只保留生成部分的概率
 
         # Compute the KL divergence between the model and the reference model
         diff = ref_per_token_logps - per_token_logps
         diff = torch.clamp(diff, min=-11.0, max=11.0) 
-
         per_token_kl = torch.exp(diff) - (diff) - 1
 
-        # Mask everything after the first EOS token
-        is_eos = completion_ids == self.processing_class.eos_token_id
+        # 将EOS token后的token进行掩码
+        is_eos = completion_ids == self.processing_class.eos_token_id #(batch*group, seq). bool阵, EOS token处为True, 其余False.
         device = self.accelerator.device
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device) #(batch*group,), 用最大序列长度初始化一个EOS的位置矩阵
+        # 对于包含EOS_tpken的行用EOS_tpken来更新前面初始化好的EOS的位置矩阵
         eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+        # 创建一个表示“当前是第几个Token”的矩阵。
         sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+        #最终的attention_mask矩阵(padding为0, 实际内容1)
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
-        # Decode the generated completions
+        # 对生成的的回答进行解码
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
         # Compute the rewards
-        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
-
+        # 将prompt复制group次, 顺序和答案的顺序对不上???????
+        # ===========这里也存在顺序问题, 这里的顺序是1个样本的所有采样在一起
+        prompts = [prompt for prompt in prompts_messages for _ in range(self.num_generations)]
+        # 初始化奖励矩阵(batch*group, 奖励函数个数)
         rewards_per_func = torch.zeros(len(prompts), len(self.reward_funcs), device=device)
         for i, (reward_func, reward_processing_class) in enumerate(
             zip(self.reward_funcs, self.reward_processing_classes)
@@ -520,34 +548,43 @@ class Qwen2VLGRPOTrainer(Trainer):
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
                 # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                # 这里的inputs是从数据集中读入的数据, 其中应该包含标准答案
+                # 这里将input中的所有key除了"prompt" and "completion"初始化一个字典
                 reward_kwargs = {key: [] for key in inputs[0].keys() if key not in ["prompt", "completion"]}
                 for key in reward_kwargs:
                     for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
+                        # 先将batch内的每个样本复制num_generations份, 再依次添加到 reward_kwargs中
+                        # ===========这里也存在顺序问题, 这里的顺序是1个样本的所有采样在一起
                         reward_kwargs[key].extend([example[key]] * self.num_generations)
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
         # Sum the rewards from all reward functions
-        rewards = rewards_per_func.sum(dim=1)
+        rewards = rewards_per_func.sum(dim=1)# (B*G)
 
         # Compute grouped-wise rewards
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        # ========.view()对原始的tensor按行来切分, 这里也是对应1个样本的所有采样在一起的顺序
+        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1) #(B)
+        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1) #(B)
 
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        # .repeat_interleave()对每个样本复制而非整体复制, 这里顺序是一个样本的所有采样在一起
+        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)# (B*G)
+        std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)# (B*G)
+        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)# (B*G)
 
         # x - x.detach() allows for preserving gradients from x
+        # 重要性采样, 但由于这里一个batch仅更新了一次, /pi_/theta_{old}就是/pi_/theta  (B*G, seq)
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        # 加入KL散度
         per_token_loss = -(per_token_loss - self.beta * per_token_kl) # default 0.04
+        # 添加掩码, 在序列维度进行平均, 在batch维度进行平均
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         
         # import pdb; pdb.set_trace()
 
         # Log the metrics
+        # 每个batch*group的平均回答长度(通过completion_mask)
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
         self._metrics["completion_length"].append(completion_length)
 
