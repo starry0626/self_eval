@@ -199,9 +199,12 @@ class Qwen2VLGRPOTrainer(Trainer):
             if "Qwen2-VL" in model_id:
                 model = Qwen2VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             elif "Qwen2.5-VL" in model_id:
-                self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
             elif "Qwen3-VL" in model_id:
-                self.ref_model = Qwen3VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                # "use_cache"参数会尝试用于覆盖config, 但Qwen3-VLconfig的该参数并不位于顶层字段, 无法正确被覆盖. 因此这里初始化后进行手动设置
+                model_init_kwargs.pop("use_cache", None)
+                model = Qwen3VLForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
+                model.config.text_config.use_cache = (False if args.gradient_checkpointing else True)
             elif "Aria" in model_id:
                 model_init_kwargs.pop("use_cache")
                 model = AriaForConditionalGeneration.from_pretrained(model, **model_init_kwargs)
@@ -230,6 +233,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                 self.ref_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
             elif "Qwen3-VL" in model_id:
                 self.ref_model = Qwen3VLForConditionalGeneration.from_pretrained(model_id, **model_init_kwargs)
+                self.ref_model.config.text_config.use_cache = (False if args.gradient_checkpointing else True)
             else:
                 self.ref_model = AutoModelForCausalLM.from_pretrained(model_id, **model_init_kwargs)
         elif peft_config is None:
