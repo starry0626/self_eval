@@ -38,7 +38,7 @@ from transformers import (
     Qwen3VLForConditionalGeneration,
     Trainer,
     TrainerCallback,
-    is_wandb_available,
+    # is_wandb_available,
 )
 from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
@@ -54,8 +54,15 @@ from qwen_vl_utils import process_vision_info
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
-if is_wandb_available():
-    import wandb
+# if is_wandb_available():
+#     import wandb
+
+import importlib.util
+def is_swanlab_available():
+    return importlib.util.find_spec("swanlab") is not None
+
+if is_swanlab_available():
+    import swanlab
 
 # What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
 # rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
@@ -218,7 +225,7 @@ class Qwen2VLGRPOTrainer(Trainer):
                     "You passed `model_init_kwargs` to the `GRPOConfig`, but your model is already instantiated. "
                     "This argument can only be used when the `model` argument is a string."
                 )
-
+        self.model_id = model_id
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
 
@@ -251,7 +258,8 @@ class Qwen2VLGRPOTrainer(Trainer):
                 processing_class = AutoProcessor.from_pretrained(model_id)
                 # 手动同步属性, 是否必须????????
                 # 将tokenlizer对应的pad_token与eos_token的id属性赋给processor
-                processing_class.pad_token_id = processing_class.tokenizer.pad_token_id
+                pad_token_id = processing_class.tokenizer.pad_token_id
+                processing_class.pad_token_id = pad_token_id
                 processing_class.eos_token_id = processing_class.tokenizer.eos_token_id
                 if "Qwen2-VL" in model_id or "Qwen2.5-VL" in model_id or "Qwen3-VL" in model_id:
                     # 手动设置分辨率
@@ -358,23 +366,36 @@ class Qwen2VLGRPOTrainer(Trainer):
     # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
-
+ 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
 
+        model_id = self.model_id# compute_loss中传入的模型应该是已经初始化好的模型
+        
         # 1. 准备 Prompts (Qwen-VL-Utils 需要原始的消息结构)
         # inputs 是一个 list of dicts (from dataset)
         # 这里的 "prompt" 键包含我们在 make_conversation_video 中构建的 [{"role": "user", "content": [...]}]
         prompts_messages = [x["prompt"] for x in inputs]
         
+        # 递归清理字典中的 None 值，消除 Arrow Schema 对齐带来的副作用
+        def clean_none_values(obj):
+            if isinstance(obj, list):
+                return [clean_none_values(x) for x in obj]
+            elif isinstance(obj, dict):
+                return {k: clean_none_values(v) for k, v in obj.items() if v is not None}
+            return obj
+        
+        prompts_messages = clean_none_values(prompts_messages)
+
         # 2. 处理视觉信息 (使用官方工具)
         # process_vision_info 会处理视频加载、采样等
         image_inputs, video_inputs, video_kwargs = process_vision_info(
             prompts_messages, 
-            return_video_kwargs=True
+            return_video_kwargs=True,
+            return_video_metadata= True if "Qwen3-VL" in model_id else False
         )
-        
+
         # 3. 使用 Processor 生成 input_ids 和 pixel_values
         # Apply chat template specifically for the prompt text structure
         texts = [
@@ -383,7 +404,7 @@ class Qwen2VLGRPOTrainer(Trainer):
         ]
         # qwen3-vl的兼容, 额外的metadata参数
         if"Qwen3-VL" in model_id:
-            videos, video_metadatas = zip(*videos)
+            videos, video_metadatas = zip(*video_inputs)
             videos, video_metadata = list(videos), list(video_metadatas)
 
             prompt_inputs = self.processing_class(
@@ -467,26 +488,78 @@ class Qwen2VLGRPOTrainer(Trainer):
 
 
         # Get the per-token log probabilities for the completions for the model and the reference model
-        def get_per_token_logps(model, input_ids, **kwargs):
-            # input_ids传入模型的的输出prompt_completion_ids(本质上时token_id. padding, dim0为拼接后的batch和group)
-            # 剩余参数传入的是prompt_inputs
-            # .logits是模型输出层预测的未归一化的分数(batch(这里是batch*group), 序列长, 词表大小)
-            logits = model(input_ids, **kwargs).logits  #(B, L, V)
-            logits = logits[:, :-1, :]  # (B, L-1, V), 去掉最后一个词的概率, 这预测的是下一个词
-            input_ids = input_ids[:, 1:]  # (B, L-1), 预测出的每个词表内所有词的分数对应的应该取的那个词(训练模型采样出来的词)
-            # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
-            per_token_logps = []
-            # 遍历dim0, 逐个进行计算(防止爆显存)
-            for logits_row, input_ids_row in zip(logits, input_ids):
-                # logits_row(L-1, V), input_ids_row(V)
-                log_probs = logits_row.log_softmax(dim=-1) #最后一个维度转化为对数概率分布
-                # torch.gather()要求索引tensor与被收集tensor的维度数一致, 这里先通过unsqueeze给索引增加一个维度
-                # torch.gather() 作用的维度不会消失, 这里用squeeze(1)把多余的那个维度去掉, 最终维度(L-1)
-                token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
-                per_token_logps.append(token_log_prob)
-            return torch.stack(per_token_logps)# (B, L-1)
+        # def get_per_token_logps(model, input_ids, **kwargs):
+        #     # input_ids传入模型的的输出prompt_completion_ids(本质上时token_id. padding, dim0为拼接后的batch和group)
+        #     # 剩余参数传入的是prompt_inputs
+        #     # .logits是模型输出层预测的未归一化的分数(batch(这里是batch*group), 序列长, 词表大小)
+        #     logits = model(input_ids, **kwargs).logits  #(B, L, V)
+        #     logits = logits[:, :-1, :]  # (B, L-1, V), 去掉最后一个词的概率, 这预测的是下一个词
+        #     input_ids = input_ids[:, 1:]  # (B, L-1), 预测出的每个词表内所有词的分数对应的应该取的那个词(训练模型采样出来的词)
+        #     # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
+        #     per_token_logps = []
+        #     # 遍历dim0, 逐个进行计算(防止爆显存)
+        #     for logits_row, input_ids_row in zip(logits, input_ids):
+        #         # logits_row(L-1, V), input_ids_row(V)
+        #         log_probs = logits_row.log_softmax(dim=-1) #最后一个维度转化为对数概率分布
+        #         # torch.gather()要求索引tensor与被收集tensor的维度数一致, 这里先通过unsqueeze给索引增加一个维度
+        #         # torch.gather() 作用的维度不会消失, 这里用squeeze(1)把多余的那个维度去掉, 最终维度(L-1)
+        #         token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+        #         per_token_logps.append(token_log_prob)
+        #     return torch.stack(per_token_logps)# (B, L-1)
 
-        if "video" in inputs[0]:
+        def get_per_token_logps(model, input_ids, **kwargs):
+            # ==========================================================
+            # 策略调整：回退到 Full Forward，但使用 Memory-Efficient Loss
+            # ==========================================================
+            
+            # 1. 显存清理：确保 Forward 前有最大空间
+            if hasattr(torch, "npu"):
+                torch.npu.empty_cache()
+            
+            # 2. 全量 Forward
+            # 既然之前这里没爆，我们就大胆地一次性跑完，避免处理 Qwen 复杂的视觉切片问题
+            outputs = model(input_ids, **kwargs)
+            
+            # 3. 获取 Logits (Batch*Gen, Seq_Len-1, Vocab)
+            # 此时显存达到峰值：Activations + Logits(1.4GB)
+            # 这里的 logits 是必须存在的，无法避免
+            logits = outputs.logits[:, :-1, :]  
+            
+            # 4. 准备 Labels (Batch*Gen, Seq_Len-1)
+            labels = input_ids[:, 1:]
+            
+            # 5. 【关键操作】立即删除 outputs 引用
+            # 虽然 Python 引用计数可能不会立即回收，但显式删除是个好习惯
+            del outputs 
+            
+            # 6. 使用 CrossEntropyLoss 计算 LogProb
+            # 这里的魔法在于：CrossEntropyLoss 是 Fused Kernel。
+            # 它不需要像 log_softmax 那样申请一个新的 (B, L, V) 1.4GB 显存。
+            # 它直接计算出 (B, L) 的结果。
+            # 显存消耗：1.4GB (Logits) + 几KB (Loss) -> 远小于 Logits + LogProb (2.8GB)
+            loss_fct = torch.nn.CrossEntropyLoss(reduction='none', ignore_index=-100)
+            
+            # 为了加速计算并节省显存，Flatten 后计算
+            token_loss = loss_fct(
+                logits.reshape(-1, logits.size(-1)), 
+                labels.reshape(-1)
+            )
+            
+            # 7. 【光速释放】
+            # 拿到结果后，立刻释放那个 1.4GB 的 Logits
+            del logits
+            
+            # 8. 还原形状并取负 (CrossEntropy = -LogProb)
+            token_log_prob = -token_loss.view(labels.shape)
+            
+            # 再次清理
+            if hasattr(torch, "npu"):
+                torch.npu.empty_cache()
+
+            return token_log_prob
+
+        # if "video" in inputs[0]:
+        if 'pixel_values_videos' in prompt_inputs:
             # 这里有问题, 视觉信息不应该复制len(prompt_completion_ids)=B*G份, 而只应该复制G份, 这使得代码只适配于batch=1的情况.
             # prompt_inputs["pixel_values_videos"] = prompt_inputs["pixel_values_videos"].repeat(len(prompt_completion_ids), 1)
             # prompt_inputs["video_grid_thw"] = prompt_inputs["video_grid_thw"].repeat(len(prompt_completion_ids), 1)

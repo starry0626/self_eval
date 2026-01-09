@@ -55,7 +55,16 @@ class GRPOScriptArguments(ScriptArguments):
         metadata={"help": "json file path"},
     )
 
-
+def get_generated_text(content):
+    """
+    Helper to extract text from GRPO generated content.
+    The content might be a string or a list of dicts (if conversational).
+    """
+    # 如果是列表且包含字典（GRPO Trainer封装的对话格式）
+    if isinstance(content, list) and len(content) > 0 and isinstance(content[0], dict):
+        return content[0].get("content", "")
+    # 如果已经是字符串
+    return content
 
 def extract_multiple_time_ranges(response: str) -> List[Tuple[float, float]]:
     """从响应中提取多个时间范围"""
@@ -102,6 +111,7 @@ def accuracy_reward_video(completions, solution, **kwargs):
     """视频QA准确率奖励"""
     rewards = []
     for content, sol in zip(completions, solution):
+        content = get_generated_text(content)
         # 提取模型答案 <answer>A</answer>
         pred_match = re.search(r'<answer>\s*([A-D])\s*</answer>', content, re.IGNORECASE)
         # 提取真值答案 (假设 dataset 中 solution 是 "A" 或者包含标签的字符串)
@@ -121,6 +131,7 @@ def temporal_reward(completions, relevant_windows, **kwargs):
     # GRPO 传递进来的 relevant_windows 列表长度等于 batch size
     # completions 是 list of list (or strings), 取决于 trainer 实现，通常是 strings
     for content, gt_wins in zip(completions, relevant_windows):
+        content = get_generated_text(content)
         pred_ranges = extract_multiple_time_ranges(content)
         # relevant_windows 在 dataset 中通常是 list of list，这里直接使用
         iou = calculate_temporal_iou_multi(pred_ranges, gt_wins)
@@ -131,6 +142,7 @@ def format_reward_video(completions, **kwargs):
     """严格遵循 evaluate_model.py 的格式奖励"""
     rewards = []
     for content in completions:
+        content = get_generated_text(content)
         has_think = bool(re.search(r'<think>.*?</think>', content, re.IGNORECASE | re.DOTALL))
         has_time = bool(re.search(r'<time_range>\s*[\d.]+\s*,\s*[\d.]+\s*</time_range>', content, re.IGNORECASE))
         has_answer = bool(re.search(r'<answer>[A-D]</answer>', content, re.IGNORECASE))
@@ -231,7 +243,7 @@ def main(script_args, training_args, model_args):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video", "video": example["path"]}, # 只传递路径，让 process_vision_info 处理
+                        {"type": "video", "video": example["path"], "fps": 0.5, "max_frames":32}, # 只传递路径，让 process_vision_info 处理
                         {"type": "text", "text": prompt_text},
                     ],
                 },

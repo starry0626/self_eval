@@ -1,3 +1,6 @@
-QVHighlights/
-NExT-GQA/
-Qwen3-VL-2B-Thinking/
+QVHighlights/*
+!QVHighlights/.gitkeep
+NExT-GQA/*
+!NExT-GQA/.gitkeep
+Qwen3-VL-2B-Thinking/*
+!Qwen3-VL-2B-Thinking/.gitkeep
