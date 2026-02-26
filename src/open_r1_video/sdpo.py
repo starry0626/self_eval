@@ -125,13 +125,13 @@ class SDPOScriptArguments(ScriptArguments):
 VIDEO_QA_PROMPT = """You are a video understanding assistant. Please analyze the provided video and answer the multiple-choice question.
 
 IMPORTANT: You MUST follow this exact format:
-1. First, enclose your step-by-step thinking process within 思考和标签
-2. Then provide your final answer choice enclosed in <answer> tags
+1. First, enclose your step-by-step thinking process within <think> and </think> tags
+2. Then provide your final answer choice enclosed in <answer> and </answer> tags
 
 Required format:
-<think]
+<think>
 Your detailed reasoning process here...
-</think]
+</think>
 <answer>
 A/B/C/D
 </answer>
