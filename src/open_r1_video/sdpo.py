@@ -39,9 +39,10 @@ import json
 
 from datasets import load_dataset, Dataset, DatasetDict
 from transformers import HfArgumentParser
-from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config, GRPOConfig
+from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from open_r1_video.trainer import Qwen2VLSDPOTrainer
+from open_r1_video.trainer.sdpo_trainer import SDPOConfig
 from open_r1_video.trainer.teacher_context_builder import TeacherContextConfig
 from open_r1_video.trainer.divergence import DivergenceConfig
 
@@ -210,7 +211,7 @@ def make_conversation_video(example: Dict[str, Any], prompt_template: str) -> Di
     }
 
 
-def main(script_args: SDPOScriptArguments, training_args: GRPOConfig, model_args: ModelConfig):
+def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args: ModelConfig):
     """
     主函数：初始化并启动 SDPO 训练
     
@@ -296,6 +297,6 @@ def main(script_args: SDPOScriptArguments, training_args: GRPOConfig, model_args
 
 
 if __name__ == "__main__":
-    parser = TrlParser((SDPOScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((SDPOScriptArguments, SDPOConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)

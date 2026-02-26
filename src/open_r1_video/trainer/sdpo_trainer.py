@@ -65,12 +65,31 @@ if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
 import importlib.util
+from dataclasses import dataclass
+
 def is_swanlab_available():
     """检查 swanlab 库是否可用"""
     return importlib.util.find_spec("swanlab") is not None
 
 if is_swanlab_available():
     import swanlab
+
+
+@dataclass
+class SDPOConfig(GRPOConfig):
+    """
+    SDPO 训练配置
+
+    继承 GRPOConfig 以复用 max_prompt_length、max_completion_length 等参数，
+    但跳过 num_generations >= 2 的验证限制，因为 SDPO 每个样本只生成一次回答。
+    """
+
+    def __post_init__(self):
+        # 跳过 GRPOConfig.__post_init__ 中的 num_generations 验证
+        # SDPO 不需要多次生成，直接调用 TrainingArguments 的初始化
+        from transformers import TrainingArguments
+        TrainingArguments.__post_init__(self)
+        self.num_generations = 1
 
 
 class Qwen2VLSDPOTrainer(Trainer):
@@ -141,7 +160,7 @@ class Qwen2VLSDPOTrainer(Trainer):
     def __init__(
         self,
         model: Union[str, PreTrainedModel],
-        args: GRPOConfig = None,
+        args: SDPOConfig = None,
         train_dataset: Optional[Union[Dataset, IterableDataset]] = None,
         eval_dataset: Optional[Union[Dataset, IterableDataset, dict[str, Union[Dataset, IterableDataset]]]] = None,
         processing_class: Optional[PreTrainedTokenizerBase] = None,
@@ -161,7 +180,7 @@ class Qwen2VLSDPOTrainer(Trainer):
         if args is None:
             model_name = model if isinstance(model, str) else model.config._name_or_path
             model_name = model_name.split("/")[-1]
-            args = GRPOConfig(f"{model_name}-SDPO")
+            args = SDPOConfig(f"{model_name}-SDPO")
 
         # ==================== 模型加载 ====================
         # 获取模型初始化参数
