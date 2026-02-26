@@ -58,8 +58,8 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from qwen_vl_utils import process_vision_info
-from teacher_context_builder import TeacherContextBuilder, TeacherContextConfig
-from divergence import DivergenceConfig, compute_reverse_kl
+from .teacher_context_builder import TeacherContextBuilder, TeacherContextConfig
+from .divergence import DivergenceConfig, compute_reverse_kl
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
@@ -274,6 +274,20 @@ class Qwen2VLSDPOTrainer(Trainer):
         
         self.video_base_dir = video_base_dir
 
+        # 计算生成提示（generation prompt）的 token 长度
+        # 用于在拼接教师输入时正确地将 generation prompt 移至额外上下文之后
+        _tokenizer = getattr(processing_class, 'tokenizer', processing_class)
+        _dummy_msg = [{"role": "user", "content": "a"}]
+        _text_with = processing_class.apply_chat_template(
+            _dummy_msg, tokenize=False, add_generation_prompt=True
+        )
+        _text_without = processing_class.apply_chat_template(
+            _dummy_msg, tokenize=False, add_generation_prompt=False
+        )
+        _ids_with = _tokenizer.encode(_text_with, add_special_tokens=False)
+        _ids_without = _tokenizer.encode(_text_without, add_special_tokens=False)
+        self._generation_prompt_len = len(_ids_with) - len(_ids_without)
+
         # 抑制 token 数量估计警告
         model.warnings_issued["estimate_tokens"] = True
 
@@ -464,17 +478,20 @@ class Qwen2VLSDPOTrainer(Trainer):
         extra_attention_mask: torch.Tensor,
         extra_prompt_inputs: dict,
         pad_token_id: int,
+        generation_prompt_len: int = 0,
+        per_sample_has_extra: list = None,
     ) -> dict:
         """
         拼接学生输入和额外上下文
-        
+
         处理流程：
         1. 去除学生输入的填充（根据 attention_mask）
         2. 去除额外输入的填充
-        3. 拼接 input_ids 和 attention_mask
-        4. 拼接视觉信息（pixel_values_videos 保持不变，pixel_values 需要拼接）
-        5. 重新填充到 batch 内最大长度
-        
+        3. 将 generation prompt 从学生输入末尾移至额外上下文之后
+        4. 拼接 input_ids 和 attention_mask
+        5. 拼接视觉信息
+        6. 重新填充到 batch 内最大长度
+
         参数:
             student_input_ids: 学生输入的 input_ids (B, L1)
             student_attention_mask: 学生输入的 attention_mask (B, L1)
@@ -483,57 +500,74 @@ class Qwen2VLSDPOTrainer(Trainer):
             extra_attention_mask: 额外输入的 attention_mask (B, L2)
             extra_prompt_inputs: 额外输入的完整字典
             pad_token_id: 填充 token ID
-        
+            generation_prompt_len: generation prompt 的 token 长度，用于重排拼接顺序
+            per_sample_has_extra: 每个样本是否有额外上下文的布尔列表
+
         返回:
             拼接后的教师输入字典
         """
         batch_size = student_input_ids.size(0)
         device = student_input_ids.device
-        
+
         # 存储每个样本的拼接结果
         concatenated_input_ids = []
         concatenated_attention_mask = []
-        
+
         for i in range(batch_size):
             # 去除学生输入的填充
             student_mask = student_attention_mask[i].bool()
             student_ids_no_pad = student_input_ids[i][student_mask]
-            
-            # 去除额外输入的填充
-            extra_mask = extra_attention_mask[i].bool()
-            extra_ids_no_pad = extra_input_ids[i][extra_mask]
-            
-            # 拼接：学生输入在前，额外输入在后
-            concat_ids = torch.cat([student_ids_no_pad, extra_ids_no_pad], dim=0)
+
+            # 检查该样本是否有额外上下文
+            has_extra = per_sample_has_extra[i] if per_sample_has_extra is not None else True
+
+            if has_extra:
+                # 去除额外输入的填充
+                extra_mask = extra_attention_mask[i].bool()
+                extra_ids_no_pad = extra_input_ids[i][extra_mask]
+
+                if len(extra_ids_no_pad) > 0 and generation_prompt_len > 0:
+                    # 将 generation prompt 从学生末尾移至额外上下文之后
+                    # 原顺序：[student_question | gen_prompt]
+                    # 目标顺序：[student_question | extra_context | gen_prompt]
+                    student_main = student_ids_no_pad[:-generation_prompt_len]
+                    gen_prompt = student_ids_no_pad[-generation_prompt_len:]
+                    concat_ids = torch.cat([student_main, extra_ids_no_pad, gen_prompt], dim=0)
+                else:
+                    concat_ids = torch.cat([student_ids_no_pad, extra_ids_no_pad], dim=0)
+            else:
+                # 该样本无额外上下文，保留学生输入原样
+                concat_ids = student_ids_no_pad
+
             concat_mask = torch.ones(concat_ids.size(0), dtype=torch.long, device=device)
-            
+
             concatenated_input_ids.append(concat_ids)
             concatenated_attention_mask.append(concat_mask)
-        
+
         # 找到最大长度
         max_length = max(ids.size(0) for ids in concatenated_input_ids)
-        
+
         # 重新填充到最大长度（左侧填充）
         padded_input_ids = []
         padded_attention_mask = []
-        
+
         for i in range(batch_size):
             ids = concatenated_input_ids[i]
             mask = concatenated_attention_mask[i]
             seq_len = ids.size(0)
             pad_len = max_length - seq_len
-            
+
             if pad_len > 0:
                 # 左侧填充
                 pad_ids = torch.full((pad_len,), pad_token_id, dtype=ids.dtype, device=device)
                 pad_mask = torch.zeros(pad_len, dtype=mask.dtype, device=device)
-                
+
                 ids = torch.cat([pad_ids, ids], dim=0)
                 mask = torch.cat([pad_mask, mask], dim=0)
-            
+
             padded_input_ids.append(ids)
             padded_attention_mask.append(mask)
-        
+
         # 堆叠成 batch
         teacher_input_ids = torch.stack(padded_input_ids, dim=0)
         teacher_attention_mask = torch.stack(padded_attention_mask, dim=0)
@@ -675,8 +709,8 @@ class Qwen2VLSDPOTrainer(Trainer):
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
 
         # 备份 input_ids 和 attention_mask（用于后续教师输入拼接）
-        prompt_inputs["input_ids_backup"] = prompt_inputs["input_ids"].clone()
-        prompt_inputs["attention_mask_backup"] = prompt_inputs["attention_mask"].clone()
+        student_input_ids_backup = prompt_inputs["input_ids"].clone()
+        student_attention_mask_backup = prompt_inputs["attention_mask"].clone()
 
         # ==================== 步骤 2: 生成回答 ====================
         # 使用学生模型生成回答（每个样本只生成一次）
@@ -686,6 +720,16 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 计算各部分的长度
         prompt_length = prompt_inputs["input_ids"].size(1)
         completion_only_ids = completion_ids[:, prompt_length:]
+
+        # 构建学生模型完整的 attention_mask（prompt + completion）
+        student_completion_attention_mask = torch.cat([
+            prompt_inputs["attention_mask"],
+            torch.ones(
+                (prompt_inputs["attention_mask"].size(0), completion_ids.size(1) - prompt_length),
+                dtype=prompt_inputs["attention_mask"].dtype,
+                device=prompt_inputs["attention_mask"].device,
+            )
+        ], dim=1)
 
         # 移除已处理的输入，保留视觉信息用于后续前向传播
         # input_ids已经包含在completion_ids中, 因而前向传播不再需要
@@ -729,8 +773,8 @@ class Qwen2VLSDPOTrainer(Trainer):
             # log_softmax(x) = x - log(sum(exp(x)))
             logits_max = logits.max(dim=-1, keepdim=True).values
             logits_minus_max = logits - logits_max
-            log_sum_exp = logits_minus_max.exp().sum(dim=-1)
-            log_softmax = logits_minus_max - log_sum_exp.log()
+            sum_exp = logits_minus_max.exp().sum(dim=-1, keepdim=True)  # (B, L-1, 1)
+            log_softmax = logits_minus_max - sum_exp.log()  # (B, L-1, V)
             
             # 获取对应位置的 log_softmax 值
             token_log_prob = torch.gather(
@@ -746,7 +790,9 @@ class Qwen2VLSDPOTrainer(Trainer):
             return token_log_prob, logits
 
         # 计算学生模型的对数概率和 logits
-        per_token_logps_student, student_logits = get_per_token_logps_and_logits(model, completion_ids, **prompt_inputs)
+        per_token_logps_student, student_logits = get_per_token_logps_and_logits(
+            model, completion_ids, attention_mask=student_completion_attention_mask, **prompt_inputs
+        )
         # 只保留生成部分的对数概率
         per_token_logps_student = per_token_logps_student[:, prompt_length - 1:]
         student_logits = student_logits[:, prompt_length - 1:, :]
@@ -755,14 +801,8 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 优化策略：只处理额外信息，然后与学生输入拼接，避免重复处理视频数据
         
         # 保存学生输入的原始数据（用于后续拼接）
-        student_input_ids = prompt_inputs.get("input_ids_backup", None)
-        student_attention_mask = prompt_inputs.get("attention_mask_backup", None)
-        
-        # 如果没有备份，从 prompt_inputs 中获取
-        if student_input_ids is None:
-            student_input_ids = prompt_inputs.get("input_ids")
-        if student_attention_mask is None:
-            student_attention_mask = prompt_inputs.get("attention_mask")
+        student_input_ids = student_input_ids_backup
+        student_attention_mask = student_attention_mask_backup
         
         # 构建额外上下文消息
         extra_contexts_messages = []
@@ -793,8 +833,12 @@ class Qwen2VLSDPOTrainer(Trainer):
         
         extra_contexts_messages = clean_none_values(extra_contexts_messages)
         
-        # 检查是否有额外上下文
-        has_extra_context = any(len(msg) > 0 and len(msg[0].get("content", [])) > 0 for msg in extra_contexts_messages)
+        # 检查是否有额外上下文（per-sample）
+        per_sample_has_extra = [
+            len(msg) > 0 and len(msg[0].get("content", [])) > 0
+            for msg in extra_contexts_messages
+        ]
+        has_extra_context = any(per_sample_has_extra)
         
         if not has_extra_context:
             # 没有额外上下文，教师输入与学生输入相同
@@ -854,6 +898,8 @@ class Qwen2VLSDPOTrainer(Trainer):
                 extra_attention_mask=extra_prompt_inputs.get("attention_mask"),
                 extra_prompt_inputs=extra_prompt_inputs,
                 pad_token_id=self.processing_class.tokenizer.pad_token_id,
+                generation_prompt_len=self._generation_prompt_len,
+                per_sample_has_extra=per_sample_has_extra,
             )
             
             teacher_prompt_length = teacher_prompt_inputs["input_ids"].size(1)
@@ -866,40 +912,19 @@ class Qwen2VLSDPOTrainer(Trainer):
 
         # ==================== 步骤 5: 计算教师模型的对数概率 ====================
         # 教师模型使用相同的生成结果，但输入包含额外上下文
-        # 需要根据教师 prompt 长度调整 completion_ids
-        
-        # 处理 prompt 长度差异
-        # 教师输入因为注入了额外上下文，长度可能比学生输入长
-        if teacher_prompt_length > prompt_length:
-            # 教师输入更长，需要在 completion_ids 前面添加 padding
-            pad_length = teacher_prompt_length - prompt_length
-            teacher_input_ids = torch.cat([
-                torch.full(
-                    (completion_ids.size(0), pad_length),
-                    self.processing_class.tokenizer.pad_token_id,
-                    dtype=completion_ids.dtype,
-                    device=completion_ids.device,
-                ),
-                completion_ids
-            ], dim=1)
-            teacher_attention_mask = torch.cat([
-                torch.zeros(
-                    (completion_ids.size(0), pad_length),
-                    dtype=torch.long,
-                    device=completion_ids.device,
-                ),
-                torch.ones(
-                    (completion_ids.size(0), completion_ids.size(1)),
-                    dtype=torch.long,
-                    device=completion_ids.device,
-                )
-            ], dim=1)
-        else:
-            # 教师输入与学生输入长度相同或更短（被截断）
-            teacher_input_ids = completion_ids.clone()
-            teacher_attention_mask = torch.ones_like(teacher_input_ids)
+        # 构建教师完整输入：[teacher_prompt | completion_only]
+        teacher_input_ids = torch.cat([
+            teacher_prompt_inputs["input_ids"],
+            completion_only_ids
+        ], dim=1)
 
-        # 移除已处理的输入
+        # 构建教师 attention_mask：使用教师 prompt 的 mask + 生成部分全 1
+        teacher_attention_mask = torch.cat([
+            teacher_prompt_inputs["attention_mask"],
+            torch.ones_like(completion_only_ids)
+        ], dim=1)
+
+        # 移除已处理的输入（视觉信息保留在 teacher_prompt_inputs 中）
         teacher_prompt_inputs.pop("input_ids", None)
         teacher_prompt_inputs.pop("attention_mask", None)
 
@@ -922,42 +947,35 @@ class Qwen2VLSDPOTrainer(Trainer):
         teacher_logits = teacher_logits[:, :min_seq_len, :]
         completion_only_ids = completion_only_ids[:, :min_seq_len]
 
-        # ==================== 步骤 7: 计算反向 KL 散度损失 ====================
-        # 使用配置的方法计算 KL 散度
+        # ==================== 步骤 7: 创建 EOS 掩码 ====================
+        # 创建 EOS token 后的掩码，只计算有效 token 的损失
+        is_eos = completion_only_ids == self.processing_class.eos_token_id
+        device = self.accelerator.device
+
+        # 找到每个序列中 EOS token 的位置
+        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+
+        # 创建序列索引
+        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
+
+        # 最终的 completion_mask：EOS 及之前的 token 为 1，之后为 0
+        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).float()
+
+        # ==================== 步骤 8: 计算反向 KL 散度损失 ====================
+        # 使用配置的方法计算 per-token KL 散度
         # KL(teacher || student) = Σ teacher(x) * log(teacher(x) / student(x))
-        
-        # 创建 mask（用于 K3 估计）
-        valid_mask = torch.ones_like(completion_only_ids, dtype=torch.float32)
-        
-        # 计算 KL 散度（使用 logits）
         kl_per_token = compute_reverse_kl(
             logits_student=student_logits,
             logits_teacher=teacher_logits,
             config=self.divergence_config,
-            mask=valid_mask,
-            sampled_tokens=completion_only_ids
-        )  # 返回 (B,)
-        
-        # 展平以便后续处理
-        kl_per_token = kl_per_token.unsqueeze(-1).expand(-1, min_seq_len)  # (B, L)
+            mask=completion_mask,
+            sampled_tokens=completion_only_ids,
+            reduce=False,
+        )  # 返回 (B, L)，已乘以 completion_mask
 
-        # ==================== 步骤 8: 创建掩码并计算最终损失 ====================
-        # 创建 EOS token 后的掩码，只计算有效 token 的损失
-        is_eos = completion_only_ids == self.processing_class.eos_token_id
-        device = self.accelerator.device
-        
-        # 找到每个序列中 EOS token 的位置
-        eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
-        eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
-        
-        # 创建序列索引
-        sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
-        
-        # 最终的 completion_mask：EOS 及之前的 token 为 1，之后为 0
-        completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
-
-        # 计算平均损失：先在序列维度平均，再在 batch 维度平均
-        loss = ((kl_per_token * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        # 计算平均损失：先在序列维度平均（除以有效 token 数），再在 batch 维度平均
+        loss = (kl_per_token.sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)).mean()
 
         # ==================== 步骤 9: 记录指标 ====================
         # 记录平均回答长度
@@ -965,7 +983,7 @@ class Qwen2VLSDPOTrainer(Trainer):
         self._metrics["completion_length"].append(completion_length)
 
         # 记录平均 KL 散度
-        mean_kl_divergence = ((kl_per_token * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+        mean_kl_divergence = (kl_per_token.sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)).mean()
         self._metrics["kl_divergence"].append(
             self.accelerator.gather_for_metrics(mean_kl_divergence).mean().item()
         )

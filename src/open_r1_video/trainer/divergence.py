@@ -33,30 +33,15 @@ def compute_full_reverse_kl_from_logits(
     返回:
         kl_per_token: KL 散度, shape (B, L)
     """
-    # 计算 log_softmax
+    # 计算 log_softmax（数值稳定）
     log_p_student = F.log_softmax(logits_student, dim=-1)
     log_p_teacher = F.log_softmax(logits_teacher, dim=-1)
-    
-    # 转换为概率
-    p_student = torch.exp(log_p_student)
+
+    # 教师概率
     p_teacher = torch.exp(log_p_teacher)
-    
-    # 添加数值稳定性
-    p_student = p_student + epsilon
-    p_teacher = p_teacher + epsilon
-    
-    # 归一化
-    p_student = p_student / p_student.sum(dim=-1, keepdim=True)
-    p_teacher = p_teacher / p_teacher.sum(dim=-1, keepdim=True)
-    
-    # 计算 log 比值
-    log_ratio = log_p_teacher - log_p_student
-    
-    # KL = Σ p_teacher * log(p_teacher / p_student)
-    kl = p_teacher * log_ratio
-    
-    # 在词表维度求和
-    kl = kl.sum(dim=-1)
+
+    # KL(teacher || student) = Σ p_teacher * (log_p_teacher - log_p_student)
+    kl = (p_teacher * (log_p_teacher - log_p_student)).sum(dim=-1)
     
     # 应用 mask
     if mask is not None:
@@ -212,19 +197,21 @@ def compute_reverse_kl(
     config: Optional[DivergenceConfig] = None,
     mask: Optional[torch.Tensor] = None,
     sampled_tokens: Optional[torch.Tensor] = None,
+    reduce: bool = True,
 ) -> torch.Tensor:
     """
     反向 KL 散度计算（从 logits 计算，统一接口）
-    
+
     参数:
         logits_student: 学生模型的 logits, shape (B, L, V)
         logits_teacher: 教师模型的 logits, shape (B, L, V)
         config: 散度计算配置
         mask: 有效 token 的掩码, shape (B, L)
         sampled_tokens: 采样的 token IDs (用于 K3 估计), shape (B, L)
-    
+        reduce: 是否对序列维度求和。True 返回 (B,)，False 返回 (B, L)
+
     返回:
-        kl: KL 散度, shape (B,)
+        kl: KL 散度, shape (B,) 或 (B, L)
     """
     config = config or DivergenceConfig()
     epsilon = config.epsilon
@@ -246,8 +233,10 @@ def compute_reverse_kl(
     else:
         raise ValueError(f"Unknown method: {config.method}")
     
-    # 对序列维度求和，返回 (B,)
-    return kl_per_token.sum(dim=-1)
+    # 对序列维度求和或保留 per-token 值
+    if reduce:
+        return kl_per_token.sum(dim=-1)  # (B,)
+    return kl_per_token  # (B, L)
 
 
 class ReverseKLLoss(torch.nn.Module):
