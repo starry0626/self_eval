@@ -532,12 +532,12 @@ class Qwen2VLSDPOTrainer(Trainer):
         concatenated_input_ids = []
         concatenated_attention_mask = []
 
-        for i in range(batch_size):
+        for i in range(batch_size):# batch内每条数据分开处理
             # 去除学生输入的填充
-            student_mask = student_attention_mask[i].bool()
-            student_ids_no_pad = student_input_ids[i][student_mask]
+            student_mask = student_attention_mask[i].bool() #mask矩阵(0,1)转化为bool阵
+            student_ids_no_pad = student_input_ids[i][student_mask] #利用bool索引保留有效token
 
-            # 检查该样本是否有额外上下文
+            # 检查该样本是否需要构建给教师模型的额外上下文信息
             has_extra = per_sample_has_extra[i] if per_sample_has_extra is not None else True
 
             if has_extra:
@@ -546,7 +546,7 @@ class Qwen2VLSDPOTrainer(Trainer):
                 extra_ids_no_pad = extra_input_ids[i][extra_mask]
 
                 if len(extra_ids_no_pad) > 0 and generation_prompt_len > 0:
-                    # 将 generation prompt 从学生末尾移至额外上下文之后
+                    # 将LLM生成所需要的引导符(Assistant:)从学生末尾移至额外上下文之后
                     # 原顺序：[student_question | gen_prompt]
                     # 目标顺序：[student_question | extra_context | gen_prompt]
                     student_main = student_ids_no_pad[:-generation_prompt_len]
@@ -557,13 +557,13 @@ class Qwen2VLSDPOTrainer(Trainer):
             else:
                 # 该样本无额外上下文，保留学生输入原样
                 concat_ids = student_ids_no_pad
-
+             #  为拼接后的新序列生成全新的 attention mask（全是 1，因为目前没有 Pad）
             concat_mask = torch.ones(concat_ids.size(0), dtype=torch.long, device=device)
 
             concatenated_input_ids.append(concat_ids)
             concatenated_attention_mask.append(concat_mask)
 
-        # 找到最大长度
+        # 找到添加额外信息后的最大长度
         max_length = max(ids.size(0) for ids in concatenated_input_ids)
 
         # 重新填充到最大长度（左侧填充）
@@ -574,7 +574,7 @@ class Qwen2VLSDPOTrainer(Trainer):
             ids = concatenated_input_ids[i]
             mask = concatenated_attention_mask[i]
             seq_len = ids.size(0)
-            pad_len = max_length - seq_len
+            pad_len = max_length - seq_len #需要填充的padding的数量
 
             if pad_len > 0:
                 # 左侧填充
@@ -598,6 +598,8 @@ class Qwen2VLSDPOTrainer(Trainer):
         }
         
         # 处理视觉信息
+        if "pixel_values_videos" in extra_prompt_inputs or"video_grid_thw" in extra_prompt_inputs:
+            raise ValueError("不支持学生信息与额外信息均包含视频视觉信息")
         # pixel_values_videos: 不包含 batch 维度，直接复制
         if "pixel_values_videos" in student_prompt_inputs:
             teacher_prompt_inputs["pixel_values_videos"] = student_prompt_inputs["pixel_values_videos"]
@@ -611,13 +613,14 @@ class Qwen2VLSDPOTrainer(Trainer):
         if "pixel_values" in extra_prompt_inputs:
             # 额外上下文有图像
             if "pixel_values" in student_prompt_inputs:
-                # 学生输入也有图像，需要拼接
-                # pixel_values 的形状是 (total_pixels, channels)，没有 batch 维度
-                # 需要按照样本分别处理
-                teacher_prompt_inputs["pixel_values"] = torch.cat([
-                    student_prompt_inputs["pixel_values"],
-                    extra_prompt_inputs["pixel_values"]
-                ], dim=0)
+                # # 学生输入也有图像，需要拼接
+                # # pixel_values 的形状是 (total_pixels, channels)，没有 batch 维度
+                # # 需要按照样本分别处理
+                # teacher_prompt_inputs["pixel_values"] = torch.cat([
+                #     student_prompt_inputs["pixel_values"],
+                #     extra_prompt_inputs["pixel_values"]
+                # ], dim=0)
+                raise ValueError("不支持学生信息与额外信息均包含图像视觉信息")
             else:
                 teacher_prompt_inputs["pixel_values"] = extra_prompt_inputs["pixel_values"]
         elif "pixel_values" in student_prompt_inputs:
@@ -626,10 +629,11 @@ class Qwen2VLSDPOTrainer(Trainer):
         # image_grid_thw: 图像网格信息
         if "image_grid_thw" in extra_prompt_inputs:
             if "image_grid_thw" in student_prompt_inputs:
-                teacher_prompt_inputs["image_grid_thw"] = torch.cat([
-                    student_prompt_inputs["image_grid_thw"],
-                    extra_prompt_inputs["image_grid_thw"]
-                ], dim=0)
+                # teacher_prompt_inputs["image_grid_thw"] = torch.cat([
+                #     student_prompt_inputs["image_grid_thw"],
+                #     extra_prompt_inputs["image_grid_thw"]
+                # ], dim=0)
+                raise ValueError("不支持学生信息与额外信息均包含图像视觉信息")
             else:
                 teacher_prompt_inputs["image_grid_thw"] = extra_prompt_inputs["image_grid_thw"]
         elif "image_grid_thw" in student_prompt_inputs:
