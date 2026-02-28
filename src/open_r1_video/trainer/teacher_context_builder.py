@@ -23,15 +23,17 @@ import numpy as np
 class TeacherContextConfig:
     """
     教师上下文配置类
-    
+
     用于控制教师模型额外输入的各部分是否包含
-    
+
     属性:
         include_answer: 是否包含标准答案
         include_temporal_text: 是否包含 temporal_grounding 的文本描述
         include_temporal_video: 是否包含 temporal_grounding 时间段的视频片段
         include_reasoning: 是否包含推理流程
-        temporal_frames_count: 时间段采样时的帧数（等间隔采样）
+        temporal_fps: 时间段视频采样帧率（每秒采样帧数）
+        temporal_max_frames: 时间段采样的最大帧数（与 fps 冲突时优先限制帧数）
+        temporal_max_pixels: 教师额外视觉输入的最大像素数（None 表示使用处理器默认值）
         point_frames_count: 时间点采样时的帧数（前后采样）
         point_frames_range: 时间点采样的前后范围（秒）
         max_temporal_segments: 最大时间片段数量（避免过长）
@@ -40,8 +42,10 @@ class TeacherContextConfig:
     include_temporal_text: bool = True
     include_temporal_video: bool = False
     include_reasoning: bool = True
-    
-    temporal_frames_count: int = 4
+
+    temporal_fps: float = 1.0
+    temporal_max_frames: int = 8
+    temporal_max_pixels: Optional[int] = None
     point_frames_count: int = 4
     point_frames_range: float = 1.0
     max_temporal_segments: int = 5
@@ -294,7 +298,9 @@ def sample_temporal_video_segments(
                 is_point=True, point_range=config.point_frames_range
             )
         else:
-            num_frames = config.temporal_frames_count
+            duration = end_time - start_time
+            desired_frames = max(1, int(duration * config.temporal_fps))
+            num_frames = min(desired_frames, config.temporal_max_frames)
             frames_with_ts = sample_frames_from_video(
                 video_path, start_time, end_time, num_frames,
                 is_point=False
@@ -402,15 +408,18 @@ def build_teacher_prompt(
                             for frame, timestamp in seg['frames_with_timestamps']:
                                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                                 pil_image = Image.fromarray(frame_rgb)
-                                
+
                                 msg["content"].append({
                                     "type": "text",
                                     "text": f"<{timestamp:.1f} seconds>"
                                 })
-                                msg["content"].append({
+                                image_item = {
                                     "type": "image",
-                                    "image": pil_image
-                                })
+                                    "image": pil_image,
+                                }
+                                if config.temporal_max_pixels is not None:
+                                    image_item["max_pixels"] = config.temporal_max_pixels
+                                msg["content"].append(image_item)
                     break
     
     if context_parts:
@@ -518,15 +527,18 @@ def build_extra_context_only(
                 for frame, timestamp in seg['frames_with_timestamps']:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     pil_image = Image.fromarray(frame_rgb)
-                    
+
                     extra_content.append({
                         "type": "text",
                         "text": f"<{timestamp:.1f} seconds>"
                     })
-                    extra_content.append({
+                    image_item = {
                         "type": "image",
-                        "image": pil_image
-                    })
+                        "image": pil_image,
+                    }
+                    if config.temporal_max_pixels is not None:
+                        image_item["max_pixels"] = config.temporal_max_pixels
+                    extra_content.append(image_item)
     
     if not extra_content:
         return []

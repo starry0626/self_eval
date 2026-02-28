@@ -51,9 +51,9 @@ from open_r1_video.trainer.divergence import DivergenceConfig
 class SDPOScriptArguments(ScriptArguments):
     """
     SDPO 训练脚本的参数配置
-    
+
     继承自 ScriptArguments，添加 SDPO 特有的参数
-    
+
     参数:
         jsonl_path: JSON/JSONL 数据集文件路径
         max_pixels: 图像/视频处理的最大像素数
@@ -63,9 +63,13 @@ class SDPOScriptArguments(ScriptArguments):
         include_temporal_text: 是否在教师上下文中包含时间定位文本
         include_temporal_video: 是否在教师上下文中包含时间定位视频片段
         include_reasoning: 是否在教师上下文中包含推理流程
-        temporal_frames_count: 时间段采样帧数
+        temporal_fps: 时间段视频采样帧率（每秒采样帧数）
+        temporal_max_frames: 时间段采样的最大帧数（与 fps 冲突时优先限制帧数）
+        teacher_temporal_max_pixels: 教师额外视觉输入的最大像素数（None 表示使用处理器默认值）
         point_frames_count: 时间点采样帧数
         max_temporal_segments: 最大时间片段数量
+        use_fixed_teacher: 是否使用固定的独立教师模型（参数不随训练更新）
+        teacher_model_path: 固定教师模型路径（None 表示使用与学生相同的模型）
     """
     jsonl_path: Optional[str] = field(
         default=None,
@@ -83,7 +87,7 @@ class SDPOScriptArguments(ScriptArguments):
         default=None,
         metadata={"help": "视频文件基础目录，用于视频帧采样"}
     )
-    
+
     include_answer: bool = field(
         default=True,
         metadata={"help": "是否在教师上下文中包含标准答案"}
@@ -100,10 +104,18 @@ class SDPOScriptArguments(ScriptArguments):
         default=True,
         metadata={"help": "是否在教师上下文中包含推理流程"}
     )
-    
-    temporal_frames_count: int = field(
-        default=4,
-        metadata={"help": "时间段采样时的帧数（等间隔采样）"}
+
+    temporal_fps: float = field(
+        default=1.0,
+        metadata={"help": "时间段视频采样帧率（每秒采样帧数）"}
+    )
+    temporal_max_frames: int = field(
+        default=8,
+        metadata={"help": "时间段采样的最大帧数（与 fps 冲突时优先限制帧数）"}
+    )
+    teacher_temporal_max_pixels: Optional[int] = field(
+        default=None,
+        metadata={"help": "教师额外视觉输入的最大像素数（None 表示使用处理器默认值）"}
     )
     point_frames_count: int = field(
         default=4,
@@ -120,6 +132,14 @@ class SDPOScriptArguments(ScriptArguments):
     divergence_top_k: int = field(
         default=20,
         metadata={"help": "Top-k 估计的 k 值（仅当 divergence_method=top_k 时有效）"}
+    )
+    use_fixed_teacher: bool = field(
+        default=False,
+        metadata={"help": "是否使用固定的独立教师模型（参数不随训练更新）"}
+    )
+    teacher_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "固定教师模型路径（None 表示使用与学生相同的模型）"}
     )
 
 
@@ -233,16 +253,22 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
     print(f"  - include_temporal_text: {script_args.include_temporal_text}")
     print(f"  - include_temporal_video: {script_args.include_temporal_video}")
     print(f"  - include_reasoning: {script_args.include_reasoning}")
-    print(f"  - temporal_frames_count: {script_args.temporal_frames_count}")
+    print(f"  - temporal_fps: {script_args.temporal_fps}")
+    print(f"  - temporal_max_frames: {script_args.temporal_max_frames}")
+    print(f"  - teacher_temporal_max_pixels: {script_args.teacher_temporal_max_pixels}")
     print(f"  - max_temporal_segments: {script_args.max_temporal_segments}")
+    print(f"  - use_fixed_teacher: {script_args.use_fixed_teacher}")
+    print(f"  - teacher_model_path: {script_args.teacher_model_path}")
     print("=" * 60)
-    
+
     teacher_context_config = TeacherContextConfig(
         include_answer=script_args.include_answer,
         include_temporal_text=script_args.include_temporal_text,
         include_temporal_video=script_args.include_temporal_video,
         include_reasoning=script_args.include_reasoning,
-        temporal_frames_count=script_args.temporal_frames_count,
+        temporal_fps=script_args.temporal_fps,
+        temporal_max_frames=script_args.temporal_max_frames,
+        temporal_max_pixels=script_args.teacher_temporal_max_pixels,
         point_frames_count=script_args.point_frames_count,
         max_temporal_segments=script_args.max_temporal_segments,
     )
@@ -281,6 +307,8 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
         max_pixels=script_args.max_pixels,
         min_pixels=script_args.min_pixels,
         attn_implementation=model_args.attn_implementation,
+        use_fixed_teacher=script_args.use_fixed_teacher,
+        teacher_model_path=script_args.teacher_model_path,
     )
     
     print("\nStarting training...")

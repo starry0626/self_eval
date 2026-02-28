@@ -42,8 +42,14 @@ INCLUDE_TEMPORAL_VIDEO=false     # 包含时间定位视频片段（需要视频
 INCLUDE_REASONING=true           # 包含推理流程
 
 # 视频采样参数
-TEMPORAL_FRAMES_COUNT=4          # 时间段采样帧数
+TEMPORAL_FPS=1.0                 # 时间段视频采样帧率（每秒采样帧数）
+TEMPORAL_MAX_FRAMES=8            # 时间段采样的最大帧数（与 fps 冲突时优先限制帧数）
+# TEACHER_TEMPORAL_MAX_PIXELS=    # 教师额外视觉输入最大像素数（注释掉则使用处理器默认值）
 MAX_TEMPORAL_SEGMENTS=5          # 最大时间片段数量
+
+# ================= 固定教师模型配置 =================
+USE_FIXED_TEACHER=false          # 是否使用固定的独立教师模型（参数不随训练更新）
+TEACHER_MODEL_PATH=""            # 固定教师模型路径（空则使用与学生相同的模型）
 
 # ================= 散度计算配置 =================
 DIVERGENCE_METHOD=full            # 散度计算方法: full, top_k, k3
@@ -77,6 +83,15 @@ SAVE_STEPS=100                   # 模型保存步数
 SAVE_ONLY_MODEL=true             # 只保存模型权重
 
 # ================= 启动命令 =================
+# 构建可选参数
+OPTIONAL_ARGS=""
+if [ -n "$TEACHER_TEMPORAL_MAX_PIXELS" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --teacher_temporal_max_pixels $TEACHER_TEMPORAL_MAX_PIXELS"
+fi
+if [ -n "$TEACHER_MODEL_PATH" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --teacher_model_path $TEACHER_MODEL_PATH"
+fi
+
 python src/open_r1_video/sdpo.py \
     --output_dir $OUTPUT_DIR \
     --model_name_or_path $MODEL_PATH \
@@ -88,8 +103,12 @@ python src/open_r1_video/sdpo.py \
     --include_temporal_text $INCLUDE_TEMPORAL_TEXT \
     --include_temporal_video $INCLUDE_TEMPORAL_VIDEO \
     --include_reasoning $INCLUDE_REASONING \
-    --temporal_frames_count $TEMPORAL_FRAMES_COUNT \
+    --temporal_fps $TEMPORAL_FPS \
+    --temporal_max_frames $TEMPORAL_MAX_FRAMES \
     --max_temporal_segments $MAX_TEMPORAL_SEGMENTS \
+    \
+    `# 固定教师模型配置` \
+    --use_fixed_teacher $USE_FIXED_TEACHER \
     \
     `# 散度计算配置` \
     --divergence_method $DIVERGENCE_METHOD \
@@ -127,6 +146,7 @@ python src/open_r1_video/sdpo.py \
     `# 其他` \
     --data_seed 42 \
     --dataloader_pin_memory false \
-    --remove_unused_columns false
+    --remove_unused_columns false \
+    $OPTIONAL_ARGS
 
 echo "Training completed! Output saved to: $OUTPUT_DIR"

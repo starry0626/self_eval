@@ -174,6 +174,8 @@ class Qwen2VLSDPOTrainer(Trainer):
         max_pixels: Optional[int] = 12845056,
         min_pixels: Optional[int] = 3136,
         attn_implementation: str = "flash_attention_2",
+        use_fixed_teacher: bool = False,
+        teacher_model_path: Optional[str] = None,
     ):
         # ==================== 参数初始化 ====================
         # 如果未提供配置，则根据模型名创建默认配置
@@ -243,6 +245,35 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 如果提供了 PEFT 配置，将模型包装为 PEFT 模型
         if peft_config is not None:
             model = get_peft_model(model, peft_config)
+
+        # ==================== 固定教师模型加载（可选）====================
+        # 当 use_fixed_teacher=True 时，加载独立的固定教师模型（参数不更新）
+        # 教师模型使用与学生相同的模型类型和精度，但不启用梯度检查点
+        self._fixed_teacher_model = None
+        if use_fixed_teacher:
+            teacher_id = teacher_model_path if teacher_model_path else model_id
+            _teacher_kwargs = {"attn_implementation": attn_implementation}
+            _teacher_dtype = model_init_kwargs.get("torch_dtype")
+            if _teacher_dtype is None:
+                _teacher_dtype = next(model.parameters()).dtype
+            if _teacher_dtype is not None and _teacher_dtype != "auto":
+                _teacher_kwargs["torch_dtype"] = _teacher_dtype
+
+            if "Qwen2-VL" in teacher_id:
+                _teacher = Qwen2VLForConditionalGeneration.from_pretrained(teacher_id, **_teacher_kwargs)
+            elif "Qwen2.5-VL" in teacher_id:
+                _teacher = Qwen2_5_VLForConditionalGeneration.from_pretrained(teacher_id, **_teacher_kwargs)
+            elif "Qwen3-VL" in teacher_id:
+                _teacher = Qwen3VLForConditionalGeneration.from_pretrained(teacher_id, **_teacher_kwargs)
+            elif "Aria" in teacher_id:
+                _teacher = AriaForConditionalGeneration.from_pretrained(teacher_id, **_teacher_kwargs)
+            else:
+                _teacher = AutoModelForCausalLM.from_pretrained(teacher_id, **_teacher_kwargs)
+
+            for param in _teacher.parameters():
+                param.requires_grad = False
+            _teacher.eval()
+            self._fixed_teacher_model = _teacher
 
         # ==================== 处理器加载 ====================
         # 处理器用于将文本和视觉信息转换为模型输入
@@ -327,6 +358,10 @@ class Qwen2VLSDPOTrainer(Trainer):
 
         # 禁用损失相关的 kwargs 检查，因为我们自定义了损失计算
         self.model_accepts_loss_kwargs = False
+
+        # 将固定教师模型移至训练设备
+        if self._fixed_teacher_model is not None:
+            self._fixed_teacher_model = self._fixed_teacher_model.to(self.accelerator.device)
 
     def _set_signature_columns_if_needed(self):
         """
@@ -952,9 +987,11 @@ class Qwen2VLSDPOTrainer(Trainer):
         teacher_prompt_inputs.pop("attention_mask", None)
 
         # 计算教师模型的对数概率和 logits（无梯度）
+        # 如果存在固定教师模型则使用固定教师，否则使用当前训练模型
+        teacher_model_for_forward = self._fixed_teacher_model if self._fixed_teacher_model is not None else model
         with torch.inference_mode():
             per_token_logps_teacher, teacher_logits = get_per_token_logps_and_logits(
-                model, teacher_input_ids, attention_mask=teacher_attention_mask, **teacher_prompt_inputs
+                teacher_model_for_forward, teacher_input_ids, attention_mask=teacher_attention_mask, **teacher_prompt_inputs
             )
         # 只保留生成部分
         per_token_logps_teacher = per_token_logps_teacher[:, teacher_prompt_length - 1:]
