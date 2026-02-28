@@ -20,13 +20,13 @@ export CUDA_LAUNCH_BLOCKING=1
 
 # ================= 路径配置 =================
 # 模型路径（支持本地路径或 HuggingFace 模型 ID）
-MODEL_PATH="Qwen/Qwen3-VL-2B-Thinking"
+MODEL_PATH="./Qwen3-VL-2B-Thinking"
 
 # 数据集路径
-DATA_PATH="./dataset/video-r2/video-r2-grpo-dataset.json"
+DATA_PATH="./dataset/video-r2/Video-R2/video-r2-grpo-dataset.json"
 
 # 视频文件基础目录（用于视频帧采样）
-VIDEO_BASE_DIR="./dataset/video-r2/Video-R2"
+VIDEO_BASE_DIR="./video_data/videos"
 
 # 输出目录
 OUTPUT_DIR="./output/sdpo/$SWANLAB_PROJECT/$SWANLAB_RUN_NAME"
@@ -57,7 +57,7 @@ DIVERGENCE_TOP_K=20              # Top-k 估计的 k 值（仅当 method=top_k �
 
 # ================= 训练参数配置 =================
 # 序列长度
-MAX_PROMPT_LENGTH=8192           # 最大 prompt 长度
+MAX_PROMPT_LENGTH=16384           # 最大 prompt 长度
 MAX_COMPLETION_LENGTH=1024       # 最大生成长度
 
 # 学习率和优化

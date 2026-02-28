@@ -180,7 +180,7 @@ def create_dataset_from_json(json_path: str) -> DatasetDict:
     })
 
 
-def make_conversation_video(example: Dict[str, Any], prompt_template: str) -> Dict[str, Any]:
+def make_conversation_video(example: Dict[str, Any], prompt_template: str, video_base_dir: str = None) -> Dict[str, Any]:
     """
     将数据集样本转换为对话格式
     
@@ -214,12 +214,15 @@ def make_conversation_video(example: Dict[str, Any], prompt_template: str) -> Di
     
     video_path = example.get("video", example.get("path", ""))
     
+    if video_base_dir and not os.path.isabs(video_path):
+        video_path = os.path.join(video_base_dir, video_path)
+    
     return {
         "prompt": [
             {
                 "role": "user",
                 "content": [
-                    {"type": "video", "video": video_path, "fps": 0.5, "max_frames": 32},
+                    {"type": "video", "video": video_path, "fps": 1, "max_frames": 32, "max_pixels": 128 * 32 * 32},
                     {"type": "text", "text": prompt_text},
                 ],
             },
@@ -289,7 +292,7 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
     print(f"\nDataset loaded: {len(dataset['train'])} samples")
     
     dataset = dataset.map(
-        lambda x: make_conversation_video(x, VIDEO_QA_PROMPT),
+        lambda x: make_conversation_video(x, VIDEO_QA_PROMPT, script_args.video_base_dir),
         remove_columns=dataset["train"].column_names if hasattr(dataset["train"], "column_names") else None
     )
     

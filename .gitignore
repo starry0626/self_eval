@@ -4,3 +4,8 @@ NExT-GQA/*
 !NExT-GQA/.gitkeep
 Qwen3-VL-2B-Thinking/*
 !Qwen3-VL-2B-Thinking/.gitkeep
+video_data/
+**/__pycache__/
+*.pyc
+# Ignore egg-info directories
+*.egg-info/
