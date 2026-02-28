@@ -298,6 +298,13 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
     
     print(f"Dataset processed, sample keys: {dataset['train'][0].keys()}")
     
+    # 将 ModelConfig 的 torch_dtype 传递给 training_args.model_init_kwargs
+    # 确保模型以指定精度加载（如 bfloat16），避免 Flash Attention 2 的 float32 警告
+    if model_args.torch_dtype is not None:
+        if training_args.model_init_kwargs is None:
+            training_args.model_init_kwargs = {}
+        training_args.model_init_kwargs["torch_dtype"] = model_args.torch_dtype
+
     trainer = Qwen2VLSDPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
