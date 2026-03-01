@@ -141,6 +141,10 @@ class SDPOScriptArguments(ScriptArguments):
         default=None,
         metadata={"help": "固定教师模型路径（None 表示使用与学生相同的模型）"}
     )
+    max_train_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "最大训练样本数，若小于数据集大小则随机采样，若大于则使用完整数据集（None 表示使用完整数据集）"}
+    )
 
 
 VIDEO_QA_PROMPT = """You are a video understanding assistant. Please analyze the provided video and answer the multiple-choice question.
@@ -297,7 +301,18 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
     )
     
     print(f"Dataset processed, sample keys: {dataset['train'][0].keys()}")
-    
+
+    # 随机采样训练数据
+    if script_args.max_train_samples is not None:
+        train_split = script_args.dataset_train_split
+        train_size = len(dataset[train_split])
+        n = min(script_args.max_train_samples, train_size)
+        if n < train_size:
+            dataset[train_split] = dataset[train_split].shuffle(seed=training_args.data_seed).select(range(n))
+            print(f"Randomly sampled {n} / {train_size} training samples (seed={training_args.data_seed})")
+        else:
+            print(f"max_train_samples ({script_args.max_train_samples}) >= dataset size ({train_size}), using full dataset")
+
     # 将 ModelConfig 的 torch_dtype 传递给 training_args.model_init_kwargs
     # 确保模型以指定精度加载（如 bfloat16），避免 Flash Attention 2 的 float32 警告
     if model_args.torch_dtype is not None:

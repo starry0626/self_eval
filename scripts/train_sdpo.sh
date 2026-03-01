@@ -55,6 +55,9 @@ TEACHER_MODEL_PATH=""            # 固定教师模型路径（空则使用与学
 DIVERGENCE_METHOD=full            # 散度计算方法: full, top_k, k3
 DIVERGENCE_TOP_K=20              # Top-k 估计的 k 值（仅当 method=top_k 时有效）
 
+# ================= 数据集配置 =================
+# MAX_TRAIN_SAMPLES=              # 最大训练样本数（注释掉则使用完整数据集）
+
 # ================= 训练参数配置 =================
 # 序列长度
 MAX_PROMPT_LENGTH=16384           # 最大 prompt 长度
@@ -90,6 +93,9 @@ if [ -n "$TEACHER_TEMPORAL_MAX_PIXELS" ]; then
 fi
 if [ -n "$TEACHER_MODEL_PATH" ]; then
     OPTIONAL_ARGS="$OPTIONAL_ARGS --teacher_model_path $TEACHER_MODEL_PATH"
+fi
+if [ -n "$MAX_TRAIN_SAMPLES" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --max_train_samples $MAX_TRAIN_SAMPLES"
 fi
 
 python src/open_r1_video/sdpo.py \
