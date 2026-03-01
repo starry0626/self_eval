@@ -38,7 +38,7 @@ mkdir -p $OUTPUT_DIR
 # 控制教师模型额外输入的各部分是否包含
 INCLUDE_ANSWER=true              # 包含标准答案
 INCLUDE_TEMPORAL_TEXT=true       # 包含时间定位文本
-INCLUDE_TEMPORAL_VIDEO=false     # 包含时间定位视频片段（需要视频文件）
+INCLUDE_TEMPORAL_VIDEO=true     # 包含时间定位视频片段（需要视频文件）
 INCLUDE_REASONING=true           # 包含推理流程
 
 # 视频采样参数

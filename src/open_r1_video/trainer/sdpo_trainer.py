@@ -338,6 +338,26 @@ class Qwen2VLSDPOTrainer(Trainer):
         _ids_without = _tokenizer.encode(_text_without, add_special_tokens=False)
         self._generation_prompt_len = len(_ids_with) - len(_ids_without)
 
+        # 计算 user 消息结尾标记 (<|im_end|>\n) 的 token 长度
+        # 用于在拼接教师输入时，将额外上下文插入到 user 消息内部（<|im_end|> 之前）
+        # 而非在 user 消息关闭之后，避免产生独立的第二轮 user 消息
+        _dummy_content_a = [{"role": "user", "content": "ab"}]
+        _dummy_content_b = [{"role": "user", "content": "abc"}]
+        _text_a = processing_class.apply_chat_template(
+            _dummy_content_a, tokenize=False, add_generation_prompt=False
+        )
+        _text_b = processing_class.apply_chat_template(
+            _dummy_content_b, tokenize=False, add_generation_prompt=False
+        )
+        # 找到 user 消息结尾标记的文本（内容之后的部分，如 "<|im_end|>\n"）
+        _suffix_a = _text_a[_text_a.rfind("ab") + len("ab"):]
+        _suffix_b = _text_b[_text_b.rfind("abc") + len("abc"):]
+        assert _suffix_a == _suffix_b, f"User end marker mismatch: {repr(_suffix_a)} vs {repr(_suffix_b)}"
+        _user_end_ids = _tokenizer.encode(_suffix_a, add_special_tokens=False)
+        self._user_end_len = len(_user_end_ids)
+        # 教师拼接时需要移动的总后缀长度 = <|im_end|>\n + <|im_start|>assistant\n
+        self._teacher_suffix_len = self._user_end_len + self._generation_prompt_len
+
         # 抑制 token 数量估计警告
         model.warnings_issued["estimate_tokens"] = True
 
@@ -532,7 +552,6 @@ class Qwen2VLSDPOTrainer(Trainer):
         extra_attention_mask: torch.Tensor,
         extra_prompt_inputs: dict,
         pad_token_id: int,
-        generation_prompt_len: int = 0,
         per_sample_has_extra: list = None,
     ) -> dict:
         """
@@ -541,7 +560,8 @@ class Qwen2VLSDPOTrainer(Trainer):
         处理流程：
         1. 去除学生输入的填充（根据 attention_mask）
         2. 去除额外输入的填充
-        3. 将 generation prompt 从学生输入末尾移至额外上下文之后
+        3. 将学生输入末尾的后缀（<|im_end|>\\n<|im_start|>assistant\\n）移至额外上下文之后
+           使额外上下文插入到原始 user 消息内部，避免产生独立的第二轮 user 消息和重复 system prompt
         4. 拼接 input_ids 和 attention_mask
         5. 拼接视觉信息
         6. 重新填充到 batch 内最大长度
@@ -554,7 +574,6 @@ class Qwen2VLSDPOTrainer(Trainer):
             extra_attention_mask: 额外输入的 attention_mask (B, L2)
             extra_prompt_inputs: 额外输入的完整字典
             pad_token_id: 填充 token ID
-            generation_prompt_len: generation prompt 的 token 长度，用于重排拼接顺序
             per_sample_has_extra: 每个样本是否有额外上下文的布尔列表
 
         返回:
@@ -562,15 +581,17 @@ class Qwen2VLSDPOTrainer(Trainer):
         """
         batch_size = student_input_ids.size(0)
         device = student_input_ids.device
+        # 总后缀长度 = <|im_end|>\n + <|im_start|>assistant\n
+        teacher_suffix_len = self._teacher_suffix_len
 
         # 存储每个样本的拼接结果
         concatenated_input_ids = []
         concatenated_attention_mask = []
 
-        for i in range(batch_size):# batch内每条数据分开处理
+        for i in range(batch_size):  # batch 内每条数据分开处理
             # 去除学生输入的填充
-            student_mask = student_attention_mask[i].bool() #mask矩阵(0,1)转化为bool阵
-            student_ids_no_pad = student_input_ids[i][student_mask] #利用bool索引保留有效token
+            student_mask = student_attention_mask[i].bool()  # mask 矩阵(0,1)转化为 bool 阵
+            student_ids_no_pad = student_input_ids[i][student_mask]  # 利用 bool 索引保留有效 token
 
             # 检查该样本是否需要构建给教师模型的额外上下文信息
             has_extra = per_sample_has_extra[i] if per_sample_has_extra is not None else True
@@ -580,13 +601,15 @@ class Qwen2VLSDPOTrainer(Trainer):
                 extra_mask = extra_attention_mask[i].bool()
                 extra_ids_no_pad = extra_input_ids[i][extra_mask]
 
-                if len(extra_ids_no_pad) > 0 and generation_prompt_len > 0:
-                    # 将LLM生成所需要的引导符(Assistant:)从学生末尾移至额外上下文之后
-                    # 原顺序：[student_question | gen_prompt]
-                    # 目标顺序：[student_question | extra_context | gen_prompt]
-                    student_main = student_ids_no_pad[:-generation_prompt_len]
-                    gen_prompt = student_ids_no_pad[-generation_prompt_len:]
-                    concat_ids = torch.cat([student_main, extra_ids_no_pad, gen_prompt], dim=0)
+                if len(extra_ids_no_pad) > 0 and teacher_suffix_len > 0:
+                    # 将学生末尾的后缀移至额外上下文之后
+                    # 后缀包含 user 消息结尾标记 + generation prompt: <|im_end|>\n<|im_start|>assistant\n
+                    # 原顺序：[...question<|im_end|>\n<|im_start|>assistant\n]
+                    # 目标顺序：[...question | extra_context | <|im_end|>\n<|im_start|>assistant\n]
+                    # 这样额外上下文被插入到 user 消息内部，成为问题的自然延续
+                    student_main = student_ids_no_pad[:-teacher_suffix_len]
+                    suffix = student_ids_no_pad[-teacher_suffix_len:]
+                    concat_ids = torch.cat([student_main, extra_ids_no_pad, suffix], dim=0)
                 else:
                     concat_ids = torch.cat([student_ids_no_pad, extra_ids_no_pad], dim=0)
             else:
@@ -841,12 +864,14 @@ class Qwen2VLSDPOTrainer(Trainer):
                         break
                 
                 # 只构建额外上下文（不包含原始视频和问题）
+                # 注意：video_base_dir 传 None，因为数据集中的 video 字段
+                # 已在 make_conversation_video() 中与 video_base_dir 拼接过，是完整路径
                 extra_msg = self.teacher_context_builder.build_extra_context_only(
                     conversations=x.get("conversations", []),
                     question_text=question_text,
                     temporal_grounding=x.get("temporal_grounding"),
                     video_path=x.get("video"),
-                    video_base_dir=self.video_base_dir
+                    video_base_dir=None
                 )
             else:
                 # 简单注入模式：构建额外上下文
@@ -884,31 +909,30 @@ class Qwen2VLSDPOTrainer(Trainer):
                 return_video_metadata=True if "Qwen3-VL" in model_id else False
             )
             
-            # 应用 chat template 生成额外文本
-            extra_texts = [
-                self.processing_class.apply_chat_template(msg, tokenize=False, add_generation_prompt=False)
-                for msg in extra_contexts_messages
-            ]
-            
+            # 直接构建裸文本（不走 chat_template，避免重复 system prompt 和 role marker）
+            # 额外上下文将作为原始 user 消息内容的延续，而非独立的第二轮对话
+            extra_texts = []
+            for msg_list in extra_contexts_messages:
+                if not msg_list or not msg_list[0].get("content"):
+                    extra_texts.append("")
+                    continue
+                raw_text = ""
+                for item in msg_list[0]["content"]:
+                    if item.get("type") == "text":
+                        raw_text += item.get("text", "")
+                    elif item.get("type") == "image":
+                        raw_text += "<|vision_start|><|image_pad|><|vision_end|>"
+                extra_texts.append(raw_text)
+
             # 处理额外文本和图像
-            if "Qwen3-VL" in model_id:
-                extra_prompt_inputs = self.processing_class(
-                    text=extra_texts,
-                    images=extra_image_inputs,
-                    videos=None,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                )
-            else:
-                extra_prompt_inputs = self.processing_class(
-                    text=extra_texts,
-                    images=extra_image_inputs,
-                    videos=None,
-                    return_tensors="pt",
-                    padding=True,
-                    padding_side="left",
-                )
+            extra_prompt_inputs = self.processing_class(
+                text=extra_texts,
+                images=extra_image_inputs,
+                videos=None,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+            )
             
             extra_prompt_inputs = super()._prepare_inputs(extra_prompt_inputs)
             
@@ -921,7 +945,6 @@ class Qwen2VLSDPOTrainer(Trainer):
                 extra_attention_mask=extra_prompt_inputs.get("attention_mask"),
                 extra_prompt_inputs=extra_prompt_inputs,
                 pad_token_id=self.processing_class.tokenizer.pad_token_id,
-                generation_prompt_len=self._generation_prompt_len,
                 per_sample_has_extra=per_sample_has_extra,
             )
             
