@@ -795,64 +795,29 @@ class Qwen2VLSDPOTrainer(Trainer):
         prompt_inputs.pop("attention_mask")
 
         # ==================== 步骤 3: 计算学生模型的对数概率 ====================
-        def get_per_token_logps_and_logits(model, input_ids, **kwargs):
+        def get_logits(model, input_ids, **kwargs):
             """
-            计算每个 token 的对数概率和 logits
-            
-            手动实现以节省显存，直接使用模型输出的 logits 计算。
-            
+            模型前向传播，获取 logits
+
             参数:
                 model: 模型
                 input_ids: 输入 token IDs
                 **kwargs: 其他模型输入（如 pixel_values）
-            
+
             返回:
-                token_log_prob: 每个 token 的对数概率，shape (B, L-1)
                 logits: 原始 logits，shape (B, L-1, V)
             """
-            # NPU 显存清理
-            if hasattr(torch, "npu"):
-                torch.npu.empty_cache()
-            
-            # 模型前向传播
             outputs = model(input_ids, **kwargs)
-            
-            # 获取 logits
             # 去掉最后一个位置（它预测的是下一个 token，但我们没有对应的 label）
             logits = outputs.logits[:, :-1, :]  # (B, L-1, V)
-            
-            # 准备 labels，去掉第一个位置（第一个 token 没有前驱预测）
-            labels = input_ids[:, 1:]  # (B, L-1)
-            
-            # 立即删除 outputs 引用以释放显存
             del outputs
-            
-            # 手动计算 log_softmax（节省显存）
-            # log_softmax(x) = x - log(sum(exp(x)))
-            logits_max = logits.max(dim=-1, keepdim=True).values
-            logits_minus_max = logits - logits_max
-            sum_exp = logits_minus_max.exp().sum(dim=-1, keepdim=True)  # (B, L-1, 1)
-            log_softmax = logits_minus_max - sum_exp.log()  # (B, L-1, V)
-            
-            # 获取对应位置的 log_softmax 值
-            token_log_prob = torch.gather(
-                log_softmax,
-                dim=-1,
-                index=labels.unsqueeze(-1)
-            ).squeeze(-1)  # (B, L-1)
-            
-            # 再次清理显存
-            if hasattr(torch, "npu"):
-                torch.npu.empty_cache()
+            return logits
 
-            return token_log_prob, logits
-
-        # 计算学生模型的对数概率和 logits
-        per_token_logps_student, student_logits = get_per_token_logps_and_logits(
+        # 计算学生模型的 logits
+        student_logits = get_logits(
             model, completion_ids, attention_mask=student_completion_attention_mask, **prompt_inputs
         )
-        # 只保留生成部分的对数概率
-        per_token_logps_student = per_token_logps_student[:, prompt_length - 1:]
+        # 只保留生成部分
         student_logits = student_logits[:, prompt_length - 1:, :]
 
         # ==================== 步骤 4: 构建教师模型输入（优化版）====================
@@ -986,23 +951,19 @@ class Qwen2VLSDPOTrainer(Trainer):
         teacher_prompt_inputs.pop("input_ids", None)
         teacher_prompt_inputs.pop("attention_mask", None)
 
-        # 计算教师模型的对数概率和 logits（无梯度）
+        # 计算教师模型的 logits（无梯度）
         # 如果存在固定教师模型则使用固定教师，否则使用当前训练模型
         teacher_model_for_forward = self._fixed_teacher_model if self._fixed_teacher_model is not None else model
         with torch.inference_mode():
-            per_token_logps_teacher, teacher_logits = get_per_token_logps_and_logits(
+            teacher_logits = get_logits(
                 teacher_model_for_forward, teacher_input_ids, attention_mask=teacher_attention_mask, **teacher_prompt_inputs
             )
         # 只保留生成部分
-        per_token_logps_teacher = per_token_logps_teacher[:, teacher_prompt_length - 1:]
         teacher_logits = teacher_logits[:, teacher_prompt_length - 1:, :]
 
         # ==================== 步骤 6: 对齐序列长度 ====================
-        # 由于 prompt 长度可能不同，生成的对数概率序列长度也可能不同
-        # 同时需要对齐 logits 的维度
-        min_seq_len = min(per_token_logps_student.size(1), per_token_logps_teacher.size(1))
-        per_token_logps_student = per_token_logps_student[:, :min_seq_len]
-        per_token_logps_teacher = per_token_logps_teacher[:, :min_seq_len]
+        # 由于 prompt 长度可能不同，生成的 logits 序列长度也可能不同
+        min_seq_len = min(student_logits.size(1), teacher_logits.size(1))
         student_logits = student_logits[:, :min_seq_len, :]
         teacher_logits = teacher_logits[:, :min_seq_len, :]
         completion_only_ids = completion_only_ids[:, :min_seq_len]
