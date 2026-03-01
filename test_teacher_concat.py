@@ -72,9 +72,32 @@ def print_tensor_dict(d: dict, title: str):
             print(f"  ['{k}']  type={type(v).__name__}")
 
 
+def compress_visual_padding(text: str) -> str:
+    """
+    将解码文本中连续重复的视觉 padding token 压缩为 <|token|>*N 格式。
+
+    例如：
+        <|image_pad|><|image_pad|><|image_pad|>  →  <|image_pad|>*3
+        <|video_pad|><|video_pad|>               →  <|video_pad|>*2
+
+    单个 token（不重复）保持原样，不加 *1 后缀。
+    """
+    import re
+
+    def _replace_run(match: re.Match) -> str:
+        token = match.group(1)           # 被重复的那个 token，如 <|image_pad|>
+        count = len(match.group(0)) // len(token)
+        return token if count == 1 else f"{token}*{count}"
+
+    # 匹配连续重复的视觉 padding token（一次覆盖 image 和 video 两种）
+    pattern = r"(<\|(?:image_pad|video_pad)\|>)+"
+    return re.sub(pattern, _replace_run, text)
+
+
 def decode_ids(tokenizer, ids: torch.Tensor, title: str):
-    """解码 input_ids 并打印"""
+    """解码 input_ids 并打印，连续视觉 padding 压缩为 token*N 格式"""
     text = tokenizer.decode(ids, skip_special_tokens=False)
+    text = compress_visual_padding(text)
     print(f"\n{'─'*70}")
     print(f"  {title}")
     print(f"{'─'*70}")
