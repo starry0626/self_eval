@@ -58,79 +58,62 @@ def compute_top_k_reverse_kl_from_logits(
     epsilon: float = 1e-8
 ) -> torch.Tensor:
     """
-    Top-k 反向 KL 散度估计（从 logits 计算）
-    
-    将概率最高的 k 个 token 单独计算，其余 token 作为一个整体（tail）计算。
-    
-    公式:
-    L ≈ Σ_top_k π(y_t|x,y<t) * log(π(y_t|x,y<t) / stopgrad(q(y_t|x,f,y<t)))
-      + tail * log(tail / stopgrad(1 - Σ_top_k q(y_t|x,f,y<t)))
-    
+    Top-k 反向 KL 散度估计（内存高效版，从 logits 计算）
+
+    将概率最高的 k 个 token 精确计算，其余 token 作为一个整体（tail）计算：
+
+        KL(teacher || student)
+            ≈ Σ_{i∈top-k} p_t_i * log(p_t_i / p_s_i)
+            + p_t_tail * log(p_t_tail / p_s_tail)
+
+    其中 p_t_tail = 1 - Σ_{i∈top-k} p_t_i，p_s_tail 同理。
+
+    与旧实现的区别：
+    - 用 gather 代替全词表 mask，所有中间张量为 (B, L, k)，不再产生 (B, L, V) 的 mask、
+      乘积、归一化等张量，峰值显存从 ~13 个 (B,L,V) 降至 ~2 个，接近 K3 估计。
+    - 修正了旧版对 top-k 概率做再归一化的数学错误（归一化后计算的是
+      KL(norm_teacher || norm_student)，不等于原始 KL 的 top-k 近似）。
+
     参数:
         logits_student: 学生模型的 logits, shape (B, L, V)
         logits_teacher: 教师模型的 logits, shape (B, L, V)
         k: top-k 的 k 值
         mask: 有效 token 的掩码, shape (B, L)
         epsilon: 数值稳定性常数
-    
+
     返回:
         kl_per_token: KL 散度估计, shape (B, L)
     """
-    # 计算概率
-    p_student = torch.softmax(logits_student, dim=-1)  # (B, L, V)
-    p_teacher = torch.softmax(logits_teacher, dim=-1)  # (B, L, V)
-    
-    # 找到 top-k 的索引
-    _, top_k_indices = torch.topk(p_teacher, k=k, dim=-1)  # (B, L, k)
-    
-    # 创建 mask
-    top_k_mask = torch.zeros_like(p_teacher)
-    top_k_mask.scatter_(-1, top_k_indices, 1.0)
-    
-    # Top-k 部分
-    p_student_top_k = p_student * top_k_mask
-    p_teacher_top_k = p_teacher * top_k_mask
-    
-    # Tail 部分 (1 - sum(top_k))
-    p_student_tail = p_student * (1 - top_k_mask)
-    p_teacher_tail = p_teacher * (1 - top_k_mask)
-    
-    # Top-k 部分的 sum
-    sum_p_student_top_k = p_student_top_k.sum(dim=-1)  # (B, L)
-    sum_p_teacher_top_k = p_teacher_top_k.sum(dim=-1)  # (B, L)
-    
-    # Tail 部分的 sum
-    sum_p_student_tail = p_student_tail.sum(dim=-1)  # (B, L)
-    sum_p_teacher_tail = p_teacher_tail.sum(dim=-1)  # (B, L)
-    
-    # 添加 epsilon
-    sum_p_student_top_k = sum_p_student_top_k + epsilon
-    sum_p_teacher_top_k = sum_p_teacher_top_k + epsilon
-    sum_p_student_tail = sum_p_student_tail + epsilon
-    sum_p_teacher_tail = sum_p_teacher_tail + epsilon
-    
-    # 归一化
-    p_student_top_k_norm = p_student_top_k / sum_p_student_top_k.unsqueeze(-1)
-    p_teacher_top_k_norm = p_teacher_top_k / sum_p_teacher_top_k.unsqueeze(-1)
-    
-    # 计算 top-k 部分的 KL
-    # KL_top_k = Σ top_k p_teacher * log(p_teacher / p_student)
-    log_ratio_top_k = p_teacher_top_k_norm.clamp(min=epsilon).log() - p_student_top_k_norm.clamp(min=epsilon).log()
-    kl_top_k = p_teacher_top_k_norm * log_ratio_top_k
-    kl_top_k = kl_top_k.sum(dim=-1)
-    
-    # 计算 tail 部分的 KL
-    # KL_tail = p_teacher_tail * log(p_teacher_tail / p_student_tail)
-    log_ratio_tail = (sum_p_teacher_tail / sum_p_student_tail).clamp(min=epsilon).log()
-    kl_tail = sum_p_teacher_tail * log_ratio_tail
-    
-    # 合并
+    # log 是单调函数，log 空间的 top-k 等价于概率空间的 top-k
+    # teacher 无梯度，(B,L,V) 张量用完后可被 CUDA allocator 立即复用
+    log_p_teacher = F.log_softmax(logits_teacher, dim=-1)          # (B, L, V) no grad
+    top_k_log_teacher, top_k_indices = torch.topk(log_p_teacher, k=k, dim=-1)  # (B, L, k)
+    del log_p_teacher  # 显式释放，让 CUDA allocator 复用此块内存
+
+    p_teacher_top_k = top_k_log_teacher.exp()                       # (B, L, k)
+    sum_p_teacher_top_k = p_teacher_top_k.sum(dim=-1)              # (B, L)
+    p_teacher_tail = (1.0 - sum_p_teacher_top_k).clamp(min=epsilon)  # (B, L)
+
+    # 学生模型：log_softmax 输出 (B,L,V) 由 autograd 保留用于反向传播（不可避免，与 K3 相同）
+    log_p_student = F.log_softmax(logits_student, dim=-1)           # (B, L, V) requires_grad
+    # gather 只取 k 个位置，后续所有运算均在 (B,L,k) 或 (B,L) 上进行
+    top_k_log_student = torch.gather(log_p_student, dim=-1, index=top_k_indices)  # (B, L, k)
+
+    p_student_top_k = top_k_log_student.exp()                       # (B, L, k)
+    sum_p_student_top_k = p_student_top_k.sum(dim=-1)              # (B, L)
+    p_student_tail = (1.0 - sum_p_student_top_k).clamp(min=epsilon)  # (B, L)
+
+    # Top-k 部分的 KL：Σ_k p_t_k * (log p_t_k - log p_s_k)
+    kl_top_k = (p_teacher_top_k * (top_k_log_teacher - top_k_log_student)).sum(dim=-1)  # (B, L)
+
+    # Tail 部分的 KL：p_t_tail * log(p_t_tail / p_s_tail)
+    kl_tail = p_teacher_tail * (p_teacher_tail / p_student_tail).clamp(min=epsilon).log()  # (B, L)
+
     kl = kl_top_k + kl_tail
-    
-    # 应用 mask
+
     if mask is not None:
         kl = kl * mask
-    
+
     return kl
 
 
