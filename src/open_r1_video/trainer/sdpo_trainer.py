@@ -119,6 +119,11 @@ class PreprocessedBatch:
     per_sample_has_extra: list
     has_extra_context: bool
 
+    def __contains__(self, item):
+        # 让 transformers Trainer 对 "labels" in batch 的检查返回 False，
+        # 而不是抛出 "argument of type 'PreprocessedBatch' is not iterable"
+        return False
+
 
 class BatchPrefetcher:
     """
