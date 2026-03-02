@@ -65,7 +65,9 @@ if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
 import importlib.util
-from dataclasses import dataclass
+import queue as _queue
+import threading
+from dataclasses import dataclass, field as _field
 
 def is_swanlab_available():
     """检查 swanlab 库是否可用"""
@@ -73,6 +75,123 @@ def is_swanlab_available():
 
 if is_swanlab_available():
     import swanlab
+
+
+def _clean_none_recursive(obj):
+    """
+    递归清理字典/列表中的 None 值
+
+    消除 HuggingFace Arrow Schema 对齐时产生的 None 值副作用，
+    避免视觉 processor 在处理含 None 的内容列表时出错。
+    """
+    if isinstance(obj, list):
+        return [_clean_none_recursive(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: _clean_none_recursive(v) for k, v in obj.items() if v is not None}
+    return obj
+
+
+@dataclass
+class PreprocessedBatch:
+    """
+    后台线程预处理完成的 batch 数据
+
+    CPU/IO 密集型操作（视频帧解码、tokenize、视觉预处理、教师上下文构建）
+    由 BatchPrefetcher 在后台线程中完成，所有 tensor 保存在 CPU 上。
+    compute_loss 收到此对象后只需将 tensor 迁移至 GPU，即可直接进行前向传播，
+    完全跳过 CPU 预处理阶段，使 GPU 利用率最大化。
+
+    属性:
+        raw_inputs:              原始 batch（list[dict]），保留用于必要时的回退访问
+        prompts_messages:        清洗后的学生 prompt 消息列表
+        prompt_inputs:           学生输入（CPU tensor dict）：input_ids, attention_mask,
+                                 pixel_values_videos, video_grid_thw 等
+        extra_contexts_messages: 教师额外上下文消息列表（每个样本一个 message list）
+        extra_prompt_inputs:     教师额外输入（CPU tensor dict）；无额外上下文时为空 dict
+        per_sample_has_extra:    每个样本是否存在有效额外上下文的布尔列表
+        has_extra_context:       batch 中是否有任何样本具有额外上下文
+    """
+    raw_inputs: list
+    prompts_messages: list
+    prompt_inputs: dict
+    extra_contexts_messages: list
+    extra_prompt_inputs: dict
+    per_sample_has_extra: list
+    has_extra_context: bool
+
+
+class BatchPrefetcher:
+    """
+    后台线程预取器：CPU 预处理与 GPU 计算流水线并行
+
+    在 GPU 训练 batch N 时，后台线程同步预处理 batch N+1 的所有 CPU/IO 密集型操作：
+    - process_vision_info：视频帧解码（最主要的 IO/CPU 瓶颈）
+    - apply_chat_template：文本格式化
+    - processing_class(...)：tokenize + 视觉预处理
+    - build_extra_context_only：教师上下文构建（可含 cv2 视频帧采样）
+
+    使用生产者-消费者模式：
+
+        DataLoader ──► [后台线程] ──► preprocess_fn ──► Queue ──► compute_loss (GPU)
+                              ▲                                         │
+                         预处理下一批                             消耗当前批
+
+    参数:
+        dataloader:    原始 DataLoader（已由 accelerator.prepare 处理）
+        preprocess_fn: 预处理函数，接受原始 batch（list），返回 PreprocessedBatch
+        queue_size:    预取队列容量（默认 2，即提前准备最多 2 个 batch）。
+                       增大会提升 GPU 利用率，但占用更多 CPU 内存。
+    """
+
+    def __init__(self, dataloader, preprocess_fn, queue_size: int = 2):
+        self.dataloader = dataloader
+        self.preprocess_fn = preprocess_fn
+        self.queue_size = queue_size
+
+    def __iter__(self):
+        q = _queue.Queue(maxsize=self.queue_size)
+        stop_event = threading.Event()
+        _DONE = object()  # 哨兵对象，标记迭代正常结束
+
+        def producer():
+            try:
+                for batch in self.dataloader:
+                    if stop_event.is_set():
+                        return
+                    try:
+                        processed = self.preprocess_fn(batch)
+                        # 队列满时阻塞，实现背压控制，防止内存无限增长
+                        q.put(processed)
+                    except Exception as e:
+                        q.put(e)
+                        return
+            finally:
+                q.put(_DONE)
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+
+        try:
+            while True:
+                item = q.get()
+                if item is _DONE:
+                    break
+                if isinstance(item, Exception):
+                    stop_event.set()
+                    raise item
+                yield item
+        finally:
+            # 确保后台线程退出（提前 break 时排空队列以解除 put 阻塞）
+            stop_event.set()
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except _queue.Empty:
+                    break
+            thread.join(timeout=10)
+
+    def __len__(self):
+        return len(self.dataloader)
 
 
 @dataclass
@@ -176,6 +295,8 @@ class Qwen2VLSDPOTrainer(Trainer):
         attn_implementation: str = "flash_attention_2",
         use_fixed_teacher: bool = False,
         teacher_model_path: Optional[str] = None,
+        use_prefetch: bool = True,
+        prefetch_queue_size: int = 2,
     ):
         # ==================== 参数初始化 ====================
         # 如果未提供配置，则根据模型名创建默认配置
@@ -361,6 +482,10 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 抑制 token 数量估计警告
         model.warnings_issued["estimate_tokens"] = True
 
+        # 预取配置：BatchPrefetcher 参数
+        self._use_prefetch = use_prefetch
+        self._prefetch_queue_size = prefetch_queue_size
+
         # 初始化指标记录字典
         self._metrics = defaultdict(list)
 
@@ -540,9 +665,168 @@ class Qwen2VLSDPOTrainer(Trainer):
         
         if not extra_content:
             return []
-        
+
         return [{"role": "user", "content": extra_content}]
-    
+
+    def _preprocess_batch_cpu(self, batch: list) -> PreprocessedBatch:
+        """
+        在（后台）线程中完成所有 CPU/IO 密集型预处理操作
+
+        处理步骤：
+        1. process_vision_info：视频帧解码（最主要的 IO/CPU 瓶颈）
+        2. apply_chat_template：文本格式化
+        3. processing_class(...)：tokenize + 视觉预处理（学生输入）
+        4. 教师额外上下文构建（可含 cv2 视频帧采样）
+        5. process_vision_info + processing_class(...)：额外上下文的视觉处理
+
+        返回 PreprocessedBatch，其中所有 tensor 均在 CPU 上。
+        compute_loss 收到后只需调用 _prepare_inputs 迁移至 GPU，
+        即可跳过全部 CPU 预处理阶段。
+
+        参数:
+            batch: DataLoader 返回的原始样本列表（list[dict]）
+
+        返回:
+            PreprocessedBatch: 预处理完成的数据
+        """
+        model_id = self.model_id
+
+        # ── 步骤 1: 提取并清洗 prompts ──
+        prompts_messages = [x["prompt"] for x in batch]
+        prompts_messages = _clean_none_recursive(prompts_messages)
+
+        # ── 步骤 2: 视频帧解码（IO/CPU 瓶颈）──
+        image_inputs, video_inputs, video_kwargs = process_vision_info(
+            prompts_messages,
+            return_video_kwargs=True,
+            return_video_metadata=True if "Qwen3-VL" in model_id else False,
+        )
+
+        # ── 步骤 3: 文本格式化 ──
+        texts = [
+            self.processing_class.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
+            for msg in prompts_messages
+        ]
+
+        # ── 步骤 4: Processor 调用（tokenize + 视觉预处理）──
+        if "Qwen3-VL" in model_id:
+            videos, video_metadatas = zip(*video_inputs) if video_inputs else ([], [])
+            videos, video_metadata = list(videos), list(video_metadatas)
+            prompt_inputs = self.processing_class(
+                text=texts,
+                images=image_inputs,
+                videos=videos if videos else None,
+                video_metadata=video_metadata if video_metadata else None,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                **video_kwargs,
+            )
+        else:
+            prompt_inputs = self.processing_class(
+                text=texts,
+                images=image_inputs,
+                videos=video_inputs,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+                **video_kwargs,
+            )
+
+        # ── 步骤 5: 构建教师额外上下文（可含 cv2 视频帧采样）──
+        teacher_contexts = [x.get(self.teacher_context_field) for x in batch]
+        extra_contexts_messages = []
+        for i, x in enumerate(batch):
+            has_raw_data = "conversations" in x or "temporal_grounding" in x
+            if has_raw_data:
+                # 从 prompt 中提取问题文本（用于答案选项解析）
+                question_text = ""
+                for item in prompts_messages[i][0].get("content", []):
+                    if item.get("type") == "text":
+                        question_text = item.get("text", "")
+                        break
+                # 只构建额外上下文部分（不含原始视频和问题，避免重复解码）
+                extra_msg = self.teacher_context_builder.build_extra_context_only(
+                    conversations=x.get("conversations", []),
+                    question_text=question_text,
+                    temporal_grounding=x.get("temporal_grounding"),
+                    video_path=x.get("video"),
+                    video_base_dir=None,
+                )
+            else:
+                # 简单注入模式：从预构建的 teacher_context 字段提取
+                extra_msg = self._build_extra_context_from_prebuilt(teacher_contexts[i])
+            extra_contexts_messages.append(extra_msg)
+
+        extra_contexts_messages = _clean_none_recursive(extra_contexts_messages)
+
+        per_sample_has_extra = [
+            len(msg) > 0 and len(msg[0].get("content", [])) > 0
+            for msg in extra_contexts_messages
+        ]
+        has_extra_context = any(per_sample_has_extra)
+
+        # ── 步骤 6: 额外上下文的视觉处理（通常只含图像帧，无完整视频）──
+        if has_extra_context:
+            extra_image_inputs, _, _ = process_vision_info(
+                extra_contexts_messages,
+                return_video_kwargs=True,
+                return_video_metadata=False,  # 额外上下文不含真实视频
+            )
+            # 构建裸文本（不走 chat_template，避免重复 system prompt 和 role marker）
+            extra_texts = []
+            for msg_list in extra_contexts_messages:
+                if not msg_list or not msg_list[0].get("content"):
+                    extra_texts.append("")
+                    continue
+                raw_text = ""
+                for item in msg_list[0]["content"]:
+                    if item.get("type") == "text":
+                        raw_text += item.get("text", "")
+                    elif item.get("type") == "image":
+                        raw_text += "<|vision_start|><|image_pad|><|vision_end|>"
+                extra_texts.append(raw_text)
+
+            extra_prompt_inputs = self.processing_class(
+                text=extra_texts,
+                images=extra_image_inputs,
+                videos=None,
+                return_tensors="pt",
+                padding=True,
+                padding_side="left",
+            )
+        else:
+            extra_prompt_inputs = {}
+
+        return PreprocessedBatch(
+            raw_inputs=batch,
+            prompts_messages=prompts_messages,
+            prompt_inputs=dict(prompt_inputs),
+            extra_contexts_messages=extra_contexts_messages,
+            extra_prompt_inputs=dict(extra_prompt_inputs) if extra_prompt_inputs else {},
+            per_sample_has_extra=per_sample_has_extra,
+            has_extra_context=has_extra_context,
+        )
+
+    def get_train_dataloader(self):
+        """
+        返回训练 DataLoader，启用预取时用 BatchPrefetcher 包装
+
+        BatchPrefetcher 在后台线程中预处理下一个 batch 的所有 CPU/IO 密集型操作，
+        使 GPU 计算（model.generate、前向传播、反向传播）与 CPU 预处理（视频解码、
+        tokenize、教师上下文构建）形成流水线，显著减少 GPU 等待时间。
+
+        预取可通过 use_prefetch=False 或 prefetch_queue_size=0 禁用。
+        """
+        dataloader = super().get_train_dataloader()
+        if self._use_prefetch:
+            return BatchPrefetcher(
+                dataloader=dataloader,
+                preprocess_fn=self._preprocess_batch_cpu,
+                queue_size=self._prefetch_queue_size,
+            )
+        return dataloader
+
     def _concat_student_and_extra_inputs(
         self,
         student_input_ids: torch.Tensor,
@@ -702,21 +986,23 @@ class Qwen2VLSDPOTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         计算损失函数 - SDPO 的核心方法
-        
+
         整体流程：
-        1. 准备学生模型的输入（原始 prompt）
-        2. 生成回答（每个样本一次）
+        1. 获取预处理结果（来自 BatchPrefetcher 的 PreprocessedBatch，或实时计算）
+        2. 将学生输入移至 GPU，生成回答
         3. 计算学生模型的对数概率
-        4. 构建教师模型输入（注入额外上下文）
+        4. 将教师额外上下文移至 GPU，拼接教师输入
         5. 计算教师模型的对数概率（无梯度）
-        6. 计算 JS 散度作为损失
-        
+        6. 计算 KL 散度作为损失
+
         参数:
             model: 训练模型
-            inputs: 输入数据，包含 prompt 和可选的 teacher_context
+            inputs: 输入数据，可以是：
+                - PreprocessedBatch: 由 BatchPrefetcher 预先处理好的数据（快速路径）
+                - list[dict]: 原始 batch（回退路径，实时预处理）
             return_outputs: 是否返回输出（SDPO 不支持）
             num_items_in_batch: batch 中的项目数
-        
+
         返回:
             loss: 计算得到的损失值
         """
@@ -724,67 +1010,23 @@ class Qwen2VLSDPOTrainer(Trainer):
             raise ValueError("The SDPOTrainer does not support returning outputs")
 
         model_id = self.model_id
-        
-        # ==================== 步骤 1: 准备学生模型输入 ====================
-        # 提取 prompt 消息和教师上下文
-        prompts_messages = [x["prompt"] for x in inputs]
-        teacher_contexts = [x.get(self.teacher_context_field) for x in inputs]
-        
-        # 递归清理字典中的 None 值，消除 Arrow Schema 对齐带来的副作用
-        def clean_none_values(obj):
-            if isinstance(obj, list):
-                return [clean_none_values(x) for x in obj]
-            elif isinstance(obj, dict):
-                return {k: clean_none_values(v) for k, v in obj.items() if v is not None}
-            return obj
-        
-        prompts_messages = clean_none_values(prompts_messages)
 
-        # 使用官方工具处理视觉信息（视频加载、采样等）
-        image_inputs, video_inputs, video_kwargs = process_vision_info(
-            prompts_messages, 
-            return_video_kwargs=True,
-            return_video_metadata=True if "Qwen3-VL" in model_id else False
-        )
-
-        # 应用 chat template 生成文本
-        texts = [
-            self.processing_class.apply_chat_template(msg, tokenize=False, add_generation_prompt=True)
-            for msg in prompts_messages
-        ]
-        
-        # 使用 processor 生成 input_ids 和 pixel_values
-        if "Qwen3-VL" in model_id:
-            # Qwen3-VL 需要额外的 metadata 参数（fps, index 等）
-            videos, video_metadatas = zip(*video_inputs) if video_inputs else ([], [])
-            videos, video_metadata = list(videos), list(video_metadatas)
-            prompt_inputs = self.processing_class(
-                text=texts,
-                images=image_inputs,
-                videos=videos if videos else None,
-                video_metadata=video_metadata if video_metadata else None,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-                **video_kwargs 
-            )
+        # ==================== 获取预处理结果 ====================
+        # 快速路径：BatchPrefetcher 已在后台线程完成所有 CPU/IO 预处理
+        # 回退路径：直接在主线程实时预处理（use_prefetch=False 或兼容旧代码）
+        if isinstance(inputs, PreprocessedBatch):
+            pb = inputs
         else:
-            prompt_inputs = self.processing_class(
-                text=texts,
-                images=image_inputs,
-                videos=video_inputs,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-                **video_kwargs
-            )
-        
-        # 将输入移动到设备
-        prompt_inputs = super()._prepare_inputs(prompt_inputs)
+            pb = self._preprocess_batch_cpu(inputs)
 
-        # 截断过长的 prompt
-        # 使用左侧截断, 即去掉开始的部分, 保留结尾部分. 但若是开始的视觉信息以及prompt就被截断了这个样本起到的效果多半也是负面的(!!!!!!!!!有待提升)
-        # 如果文本中的视觉占位符被截掉但视觉token数量没变是否会报错
+        prompts_messages = pb.prompts_messages
+
+        # ==================== 步骤 1: 将学生输入移至 GPU ====================
+        # pb.prompt_inputs 是 CPU tensors，_prepare_inputs 负责迁移至训练设备
+        prompt_inputs = super()._prepare_inputs(pb.prompt_inputs)
+
+        # 截断过长的 prompt（左侧截断，保留末尾的问题和格式化信息）
+        # 注意：若视觉占位符被截断但视觉 token 数量未变可能导致对齐错误（待优化）
         if self.max_prompt_length is not None:
             prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -self.max_prompt_length :]
             prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -self.max_prompt_length :]
@@ -843,99 +1085,33 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 只保留生成部分
         student_logits = student_logits[:, prompt_length - 1:, :]
 
-        # ==================== 步骤 4: 构建教师模型输入（优化版）====================
-        # 优化策略：只处理额外信息，然后与学生输入拼接，避免重复处理视频数据
-        
-        # 保存学生输入的原始数据（用于后续拼接）
+        # ==================== 步骤 4: 构建教师模型输入 ====================
+        # 使用 PreprocessedBatch 中已在后台线程处理好的教师额外上下文数据，
+        # 直接将 CPU tensors 迁移至 GPU，避免重复进行视频解码和 processor 调用。
+
+        # 恢复学生输入的原始数据（用于后续拼接）
         student_input_ids = student_input_ids_backup
         student_attention_mask = student_attention_mask_backup
-        
-        # 构建额外上下文消息
-        extra_contexts_messages = []
-        for i, x in enumerate(inputs):
-            has_raw_data = "conversations" in x or "temporal_grounding" in x
-            
-            if has_raw_data:
-                # 提取问题文本
-                question_text = ""
-                for item in prompts_messages[i][0].get("content", []):
-                    if item.get("type") == "text":
-                        question_text = item.get("text", "")
-                        break
-                
-                # 只构建额外上下文（不包含原始视频和问题）
-                # 注意：video_base_dir 传 None，因为数据集中的 video 字段
-                # 已在 make_conversation_video() 中与 video_base_dir 拼接过，是完整路径
-                extra_msg = self.teacher_context_builder.build_extra_context_only(
-                    conversations=x.get("conversations", []),
-                    question_text=question_text,
-                    temporal_grounding=x.get("temporal_grounding"),
-                    video_path=x.get("video"),
-                    video_base_dir=None
-                )
-            else:
-                # 简单注入模式：构建额外上下文
-                extra_msg = self._build_extra_context_from_prebuilt(teacher_contexts[i])
-            
-            extra_contexts_messages.append(extra_msg)
-        
-        extra_contexts_messages = clean_none_values(extra_contexts_messages)
-        
-        # 检查是否有额外上下文（per-sample）
-        per_sample_has_extra = [
-            len(msg) > 0 and len(msg[0].get("content", [])) > 0
-            for msg in extra_contexts_messages
-        ]
-        has_extra_context = any(per_sample_has_extra)
-        
-        if not has_extra_context:
+
+        if not pb.has_extra_context:
             # 没有额外上下文，教师输入与学生输入相同
             teacher_prompt_inputs = {
-                "input_ids": student_input_ids.clone() if student_input_ids is not None else None,
-                "attention_mask": student_attention_mask.clone() if student_attention_mask is not None else None,
+                "input_ids": student_input_ids.clone(),
+                "attention_mask": student_attention_mask.clone(),
             }
             # 复制视觉信息
             for key in ["pixel_values_videos", "video_grid_thw", "pixel_values", "image_grid_thw"]:
                 if key in prompt_inputs:
-                    teacher_prompt_inputs[key] = prompt_inputs[key].clone() if isinstance(prompt_inputs[key], torch.Tensor) else prompt_inputs[key]
-            
+                    teacher_prompt_inputs[key] = (
+                        prompt_inputs[key].clone()
+                        if isinstance(prompt_inputs[key], torch.Tensor)
+                        else prompt_inputs[key]
+                    )
             teacher_prompt_length = prompt_length
         else:
-            # 有额外上下文，需要处理并拼接
-            # 处理额外上下文的视觉信息（只有图像帧，没有视频）
-            extra_image_inputs, extra_video_inputs, extra_video_kwargs = process_vision_info(
-                extra_contexts_messages,
-                return_video_kwargs=True,
-                return_video_metadata=True if "Qwen3-VL" in model_id else False
-            )
-            
-            # 直接构建裸文本（不走 chat_template，避免重复 system prompt 和 role marker）
-            # 额外上下文将作为原始 user 消息内容的延续，而非独立的第二轮对话
-            extra_texts = []
-            for msg_list in extra_contexts_messages:
-                if not msg_list or not msg_list[0].get("content"):
-                    extra_texts.append("")
-                    continue
-                raw_text = ""
-                for item in msg_list[0]["content"]:
-                    if item.get("type") == "text":
-                        raw_text += item.get("text", "")
-                    elif item.get("type") == "image":
-                        raw_text += "<|vision_start|><|image_pad|><|vision_end|>"
-                extra_texts.append(raw_text)
+            # 将后台线程预处理好的额外上下文 CPU tensors 迁移至 GPU
+            extra_prompt_inputs = super()._prepare_inputs(pb.extra_prompt_inputs)
 
-            # 处理额外文本和图像
-            extra_prompt_inputs = self.processing_class(
-                text=extra_texts,
-                images=extra_image_inputs,
-                videos=None,
-                return_tensors="pt",
-                padding=True,
-                padding_side="left",
-            )
-            
-            extra_prompt_inputs = super()._prepare_inputs(extra_prompt_inputs)
-            
             # ==================== 拼接学生输入和额外上下文 ====================
             teacher_prompt_inputs = self._concat_student_and_extra_inputs(
                 student_input_ids=student_input_ids,
@@ -945,9 +1121,8 @@ class Qwen2VLSDPOTrainer(Trainer):
                 extra_attention_mask=extra_prompt_inputs.get("attention_mask"),
                 extra_prompt_inputs=extra_prompt_inputs,
                 pad_token_id=self.processing_class.tokenizer.pad_token_id,
-                per_sample_has_extra=per_sample_has_extra,
+                per_sample_has_extra=pb.per_sample_has_extra,
             )
-            
             teacher_prompt_length = teacher_prompt_inputs["input_ids"].size(1)
         
         # 截断教师输入
