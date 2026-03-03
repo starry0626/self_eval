@@ -147,13 +147,13 @@ class SDPOScriptArguments(ScriptArguments):
     )
 
 
-VIDEO_QA_PROMPT = """You are a video understanding assistant. Please analyze the provided video and answer the multiple-choice question.
+VIDEO_QA_PROMPT = """Please analyze the provided video and answer the multiple-choice question strictly based on the content of the video.
 
-IMPORTANT: You MUST follow this exact format:
-1. First, enclose your step-by-step thinking process within <think> and </think> tags
-2. Then provide your final answer choice enclosed in <answer> and </answer> tags
+You need to follow the following process: 
+1. First, enclose your step-by-step thinking process within <think> and </think> tags.
+2. Then provide your final answer choice enclosed in <answer> and </answer> tags. Only output the letter corresponding to the correct option (A, B, C, or D), and nothing else, do not restate the answer text.
 
-Required format:
+Respond in the following format:
 <think>
 Your detailed reasoning process here...
 </think>
@@ -161,11 +161,7 @@ Your detailed reasoning process here...
 A/B/C/D
 </answer>
 
-Question: {question}
-Options:
-{options}
-
-Note: The video duration is approximately {duration} seconds."""
+{question}"""
 
 
 def create_dataset_from_json(json_path: str) -> DatasetDict:
@@ -201,20 +197,15 @@ def make_conversation_video(example: Dict[str, Any], prompt_template: str, video
         question_text = conversations[0].get("value", "")
     else:
         question_text = example.get("problem", example.get("question", ""))
+
+    # 数据集中部分样本的问题文本末尾附带了引导式思考指令（如 "Please think about this
+    # question as if you were a human pondering deeply..."），与训练脚本自定义的 prompt
+    # 格式重复，在此统一截断。
+    _ponder_marker = "Please think about this question as if you were a human pondering deeply"
+    if _ponder_marker in question_text:
+        question_text = question_text[:question_text.index(_ponder_marker)].rstrip()
     
-    options = example.get("options", [])
-    if isinstance(options, list):
-        options_text = "\n".join(options)
-    else:
-        options_text = str(options)
-    
-    duration = example.get("duration", "unknown")
-    
-    prompt_text = prompt_template.format(
-        question=question_text,
-        options=options_text,
-        duration=duration
-    )
+    prompt_text = prompt_template.format(question=question_text)
     
     video_path = example.get("video", example.get("path", ""))
     
