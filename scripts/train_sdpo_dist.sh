@@ -51,8 +51,11 @@ INCLUDE_REASONING=false
 
 TEMPORAL_FPS=1.0
 TEMPORAL_MAX_FRAMES=8
-# TEACHER_TEMPORAL_MAX_PIXELS=    # 注释掉则使用处理器默认值
+TEACHER_TEMPORAL_MAX_PIXELS=16384   # 注释掉则使用处理器默认值
 MAX_TEMPORAL_SEGMENTS=5
+POINT_FRAMES_COUNT=4
+POINT_FRAMES_RANGE=1.0          # 时间点采样前后范围（秒），以时间点为中心采样 ±RANGE 区间
+MAX_TOTAL_EXTRA_FRAMES=48        # 注释掉则不限制额外视频总帧数；设置后对每个片段等比例缩减
 
 # ================= 固定教师模型配置 =================
 # 注意：ZeRO-3 下固定教师模型的参数也会被分片，USE_FIXED_TEACHER=true 时请确认显存足够
@@ -99,6 +102,9 @@ fi
 if [ -n "$MAX_TRAIN_SAMPLES" ]; then
     OPTIONAL_ARGS="$OPTIONAL_ARGS --max_train_samples $MAX_TRAIN_SAMPLES"
 fi
+if [ -n "$MAX_TOTAL_EXTRA_FRAMES" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --max_total_extra_frames $MAX_TOTAL_EXTRA_FRAMES"
+fi
 
 # ================= 打印启动信息 =================
 echo "=========================================="
@@ -131,6 +137,8 @@ torchrun \
     --temporal_fps $TEMPORAL_FPS \
     --temporal_max_frames $TEMPORAL_MAX_FRAMES \
     --max_temporal_segments $MAX_TEMPORAL_SEGMENTS \
+    --point_frames_count $POINT_FRAMES_COUNT \
+    --point_frames_range $POINT_FRAMES_RANGE \
     \
     `# 固定教师模型配置` \
     --use_fixed_teacher $USE_FIXED_TEACHER \

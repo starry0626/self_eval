@@ -68,7 +68,9 @@ class SDPOScriptArguments(ScriptArguments):
         temporal_max_frames: 时间段采样的最大帧数（与 fps 冲突时优先限制帧数）
         teacher_temporal_max_pixels: 教师额外视觉输入的最大像素数（None 表示使用处理器默认值）
         point_frames_count: 时间点采样帧数
+        point_frames_range: 时间点采样的前后范围（秒），以时间点为中心采样 [center-range, center+range] 区间内的帧
         max_temporal_segments: 最大时间片段数量
+        max_total_extra_frames: 所有额外视频片段的最大总帧数，超出时对每个片段等比例降低采样帧数（None 表示不限制）
         use_fixed_teacher: 是否使用固定的独立教师模型（参数不随训练更新）
         teacher_model_path: 固定教师模型路径（None 表示使用与学生相同的模型）
     """
@@ -122,9 +124,17 @@ class SDPOScriptArguments(ScriptArguments):
         default=4,
         metadata={"help": "时间点采样时的帧数（前后采样）"}
     )
+    point_frames_range: float = field(
+        default=1.0,
+        metadata={"help": "时间点采样的前后范围（秒），以时间点为中心采样 [center-range, center+range] 区间内的帧"}
+    )
     max_temporal_segments: int = field(
         default=5,
         metadata={"help": "最大时间片段数量，避免上下文过长"}
+    )
+    max_total_extra_frames: Optional[int] = field(
+        default=None,
+        metadata={"help": "所有额外视频片段的最大总帧数，超出时对每个片段等比例降低采样帧数（None 表示不限制）"}
     )
     divergence_method: str = field(
         default="full",
@@ -331,7 +341,10 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
     print(f"  - temporal_fps: {script_args.temporal_fps}")
     print(f"  - temporal_max_frames: {script_args.temporal_max_frames}")
     print(f"  - teacher_temporal_max_pixels: {script_args.teacher_temporal_max_pixels}")
+    print(f"  - point_frames_count: {script_args.point_frames_count}")
+    print(f"  - point_frames_range: {script_args.point_frames_range}")
     print(f"  - max_temporal_segments: {script_args.max_temporal_segments}")
+    print(f"  - max_total_extra_frames: {script_args.max_total_extra_frames}")
     print(f"  - use_fixed_teacher: {script_args.use_fixed_teacher}")
     print(f"  - teacher_model_path: {script_args.teacher_model_path}")
     print("=" * 60)
@@ -345,7 +358,9 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
         temporal_max_frames=script_args.temporal_max_frames,
         temporal_max_pixels=script_args.teacher_temporal_max_pixels,
         point_frames_count=script_args.point_frames_count,
+        point_frames_range=script_args.point_frames_range,
         max_temporal_segments=script_args.max_temporal_segments,
+        max_total_extra_frames=script_args.max_total_extra_frames,
     )
     
     divergence_config = DivergenceConfig(

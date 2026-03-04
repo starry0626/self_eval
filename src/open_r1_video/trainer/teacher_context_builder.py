@@ -35,8 +35,9 @@ class TeacherContextConfig:
         temporal_max_frames: 时间段采样的最大帧数（与 fps 冲突时优先限制帧数）
         temporal_max_pixels: 教师额外视觉输入的最大像素数（None 表示使用处理器默认值）
         point_frames_count: 时间点采样时的帧数（前后采样）
-        point_frames_range: 时间点采样的前后范围（秒）
+        point_frames_range: 时间点采样的前后范围（秒），以时间点为中心采样 [center-range, center+range] 区间内的帧
         max_temporal_segments: 最大时间片段数量（避免过长）
+        max_total_extra_frames: 所有额外视频片段的最大总帧数（None 表示不限制），超出时对每个片段等比例降低采样帧数
     """
     include_answer: bool = True
     include_temporal_text: bool = True
@@ -49,6 +50,7 @@ class TeacherContextConfig:
     point_frames_count: int = 4
     point_frames_range: float = 1.0
     max_temporal_segments: int = 5
+    max_total_extra_frames: Optional[int] = None
 
 
 def parse_timestamp(timestamp_str: str) -> Tuple[float, float]:
@@ -266,55 +268,71 @@ def sample_temporal_video_segments(
 ) -> List[Dict[str, Any]]:
     """
     采样 temporal_grounding 时间段的视频帧
-    
+
     参数:
         video_path: 视频文件路径
         temporal_grounding: 时间定位字典
         config: 教师上下文配置
-    
+
     返回:
         video_segments: 视频片段列表，每个片段包含时间戳、描述和采样帧（带时间戳）
     """
     if not temporal_grounding or not os.path.exists(video_path):
         return []
-    
-    video_segments = []
-    count = 0
-    
+
+    # ==================== 第一遍：规划每个片段的采样帧数 ====================
+    plan = []
     for timestamp, description in temporal_grounding.items():
         if description is None:
             continue
-        
-        if count >= config.max_temporal_segments:
+        if len(plan) >= config.max_temporal_segments:
             break
-        
+
         start_time, end_time = parse_timestamp(timestamp)
-        is_point = start_time == end_time
-        
+        is_point = (start_time == end_time)
+
         if is_point:
             num_frames = config.point_frames_count
-            frames_with_ts = sample_frames_from_video(
-                video_path, start_time, end_time, num_frames,
-                is_point=True, point_range=config.point_frames_range
-            )
         else:
             duration = end_time - start_time
             desired_frames = max(1, int(duration * config.temporal_fps))
             num_frames = min(desired_frames, config.temporal_max_frames)
-            frames_with_ts = sample_frames_from_video(
-                video_path, start_time, end_time, num_frames,
-                is_point=False
-            )
-        
+
+        plan.append({
+            "timestamp": timestamp,
+            "description": description,
+            "start_time": start_time,
+            "end_time": end_time,
+            "is_point": is_point,
+            "num_frames": num_frames,
+        })
+
+    # ==================== 等比例降低：总帧数超限时缩减每个片段的采样帧数 ====================
+    if config.max_total_extra_frames is not None and plan:
+        total_frames = sum(s["num_frames"] for s in plan)
+        if total_frames > config.max_total_extra_frames:
+            ratio = config.max_total_extra_frames / total_frames
+            for s in plan:
+                s["num_frames"] = max(1, int(s["num_frames"] * ratio))
+
+    # ==================== 第二遍：实际采样帧 ====================
+    video_segments = []
+    for s in plan:
+        frames_with_ts = sample_frames_from_video(
+            video_path,
+            s["start_time"], s["end_time"],
+            s["num_frames"],
+            is_point=s["is_point"],
+            point_range=config.point_frames_range,
+        )
         if frames_with_ts:
             video_segments.append({
-                "timestamp": timestamp,
-                "description": description,
+                "timestamp": s["timestamp"],
+                "description": s["description"],
                 "frames_with_timestamps": frames_with_ts,
-                "is_point": is_point
+                "is_point": s["is_point"],
             })
-            count += 1
-    
+
     return video_segments
 
 
