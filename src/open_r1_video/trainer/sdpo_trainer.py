@@ -53,7 +53,7 @@ from transformers import (
 )
 from transformers.utils import is_peft_available
 
-from trl.models import unwrap_model_for_generation
+from trl.models import prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
@@ -509,9 +509,14 @@ class Qwen2VLSDPOTrainer(Trainer):
         # 禁用损失相关的 kwargs 检查，因为我们自定义了损失计算
         self.model_accepts_loss_kwargs = False
 
-        # 将固定教师模型移至训练设备
+        # 将固定教师模型注册进 DeepSpeed / Accelerate，确保 ZeRO-3 下参数分片和聚合 hooks 一致
         if self._fixed_teacher_model is not None:
-            self._fixed_teacher_model = self._fixed_teacher_model.to(self.accelerator.device)
+            if self.is_deepspeed_enabled:
+                self._fixed_teacher_model = prepare_deepspeed(self._fixed_teacher_model, self.accelerator)
+            else:
+                self._fixed_teacher_model = self.accelerator.prepare_model(
+                    self._fixed_teacher_model, evaluation_mode=True
+                )
 
     def _set_signature_columns_if_needed(self):
         """

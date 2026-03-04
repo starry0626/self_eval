@@ -6,7 +6,7 @@
 
 # ================= GPU 配置 =================
 # 参与训练的 GPU 编号（逗号分隔）
-CUDA_VISIBLE_DEVICES=0,1,2,3
+CUDA_VISIBLE_DEVICES=0,1
 export CUDA_VISIBLE_DEVICES
 
 # 自动统计 GPU 数量（根据上面的 CUDA_VISIBLE_DEVICES 推断）
@@ -47,7 +47,7 @@ mkdir -p $OUTPUT_DIR
 INCLUDE_ANSWER=true
 INCLUDE_TEMPORAL_TEXT=true
 INCLUDE_TEMPORAL_VIDEO=true
-INCLUDE_REASONING=true
+INCLUDE_REASONING=false
 
 TEMPORAL_FPS=1.0
 TEMPORAL_MAX_FRAMES=8
@@ -56,15 +56,15 @@ MAX_TEMPORAL_SEGMENTS=5
 
 # ================= 固定教师模型配置 =================
 # 注意：ZeRO-3 下固定教师模型的参数也会被分片，USE_FIXED_TEACHER=true 时请确认显存足够
-USE_FIXED_TEACHER=false
-TEACHER_MODEL_PATH=""
+USE_FIXED_TEACHER=true
+TEACHER_MODEL_PATH="./Qwen3-VL-4B-Thinking"
 
 # ================= 散度计算配置 =================
-DIVERGENCE_METHOD=full
-DIVERGENCE_TOP_K=20
+DIVERGENCE_METHOD=top_k
+DIVERGENCE_TOP_K=100
 
 # ================= 数据集配置 =================
-# MAX_TRAIN_SAMPLES=
+MAX_TRAIN_SAMPLES=1000
 
 # ================= 训练参数配置 =================
 MAX_PROMPT_LENGTH=16384
@@ -75,7 +75,7 @@ BETA=0.04
 WARMUP_RATIO=0.05
 
 # 每卡 batch size；总有效 batch = NUM_GPUS × PER_DEVICE_TRAIN_BATCH_SIZE × GRADIENT_ACCUMULATION_STEPS
-PER_DEVICE_TRAIN_BATCH_SIZE=2
+PER_DEVICE_TRAIN_BATCH_SIZE=8
 GRADIENT_ACCUMULATION_STEPS=1
 
 NUM_TRAIN_EPOCHS=1
