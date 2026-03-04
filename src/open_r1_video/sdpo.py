@@ -30,6 +30,7 @@ SDPO 使用模型自身作为教师，教师接收额外的上下文信息（答
         --include_reasoning true
 """
 
+import dataclasses
 import os
 import re
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from typing import Optional, List, Dict, Any
 import json
 
 from datasets import load_dataset, Dataset, DatasetDict
-from transformers import HfArgumentParser
+from transformers import HfArgumentParser, TrainerCallback
 from trl import ModelConfig, ScriptArguments, TrlParser, get_peft_config
 
 from open_r1_video.trainer import Qwen2VLSDPOTrainer
@@ -229,6 +230,82 @@ def make_conversation_video(example: Dict[str, Any], prompt_template: str, video
     }
 
 
+def _collect_run_config(
+    script_args: "SDPOScriptArguments",
+    training_args: "SDPOConfig",
+    model_args: "ModelConfig",
+) -> dict:
+    """
+    收集启动脚本中设置的所有参数，返回可序列化的扁平字典。
+
+    参数按来源分组并加前缀：
+      script/*   — SDPOScriptArguments（数据集路径、教师上下文、散度配置等）
+      model/*    — ModelConfig（模型路径、精度、注意力实现等）
+      training/* — SDPOConfig 中启动脚本明确设置的训练超参数
+    """
+
+    def _safe(v):
+        """将不可 JSON 序列化的值转换为字符串"""
+        return v if isinstance(v, (bool, int, float, str, type(None))) else str(v)
+
+    config: Dict[str, Any] = {}
+
+    # --- script_args ---
+    for f in dataclasses.fields(script_args):
+        config[f"script/{f.name}"] = _safe(getattr(script_args, f.name))
+
+    # --- model_args ---
+    for f in dataclasses.fields(model_args):
+        config[f"model/{f.name}"] = _safe(getattr(model_args, f.name))
+
+    # --- training_args: 仅记录启动脚本中明确设置的关键超参数 ---
+    _training_keys = [
+        "output_dir",
+        "deepspeed",
+        "learning_rate",
+        "warmup_ratio",
+        "per_device_train_batch_size",
+        "gradient_accumulation_steps",
+        "num_train_epochs",
+        "bf16",
+        "gradient_checkpointing",
+        "logging_steps",
+        "save_steps",
+        "save_only_model",
+        "data_seed",
+        "dataloader_pin_memory",
+        # GRPOConfig / SDPOConfig 专有字段
+        "max_prompt_length",
+        "max_completion_length",
+        "beta",
+    ]
+    for k in _training_keys:
+        config[f"training/{k}"] = _safe(getattr(training_args, k, None))
+
+    return config
+
+
+class _SwanLabConfigCallback(TrainerCallback):
+    """
+    训练开始时将所有运行配置写入 SwanLab config。
+
+    SwanLabCallback 会在 on_train_begin 中调用 swanlab.init()；
+    本 callback 在其之后执行，因此可安全调用 swanlab.config.update()。
+    """
+
+    def __init__(self, config: dict):
+        self._config = config
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return
+        try:
+            import swanlab  # noqa: PLC0415
+            swanlab.config.update(self._config)
+        except Exception as exc:
+            print(f"[SwanLab] 写入 config 失败（不影响训练）: {exc}")
+
+
 def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args: ModelConfig):
     """
     主函数：初始化并启动 SDPO 训练
@@ -325,6 +402,7 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
         attn_implementation=model_args.attn_implementation,
         use_fixed_teacher=script_args.use_fixed_teacher,
         teacher_model_path=script_args.teacher_model_path,
+        callbacks=[_SwanLabConfigCallback(_collect_run_config(script_args, training_args, model_args))],
     )
     
     print("\nStarting training...")
