@@ -1,0 +1,371 @@
+"""
+VideoQA 评估数据集适配器
+
+每个数据集提供一个 build_messages 函数，将 JSON 样本转换为模型输入所需的 messages 格式。
+
+所有函数签名统一为:
+    build_messages(sample, video_base_dir, fps, max_frames, max_pixels, answer_mode)
+    -> (messages: list, gt_answer: str, sample_id: str)
+
+answer_mode:
+    "think"  - 先思考后回答，模型输出 <think>...</think><answer>X</answer>，从 XML 标签提取答案
+    "direct" - 直接回答，模型直接输出选项字母或数字
+
+支持的数据集（均位于 src/open_r1_video/eval/ 目录）:
+    mmvu        - 科学领域视频多选题（A-E，5选项）
+    mvbench     - 动作/运动理解视频多选题（A-C，3选项）
+    tempcompass - 时序理解视频二选题（A-B，维度: action/direction/...）
+    videomme    - 通用视频理解多选题（A-D，short/medium/long 时长分类）
+    videommmu   - 学术领域视频多选题（A-J，最多10选项）
+    vsibench    - 空间理解视频回归题（物体计数，无选项，数值答案）
+"""
+
+import os
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ======================== 提示词模板 ========================
+
+# 思考模式：多选题
+MC_THINK_PROMPT = """\
+Please analyze the provided video carefully and answer the multiple-choice question.
+
+You MUST follow this exact format:
+<think>
+Your detailed step-by-step reasoning process here...
+</think>
+<answer>
+X
+</answer>
+where X is the single option letter (A, B, C, D, etc.) with no additional text.
+
+Question: {question}
+Options:
+{options}"""
+
+# 直接回答模式：多选题
+MC_DIRECT_PROMPT = """\
+Please analyze the provided video carefully and answer the multiple-choice question.
+Output ONLY the single option letter (A, B, C, D, etc.) corresponding to your answer, with no explanation or other text.
+
+Question: {question}
+Options:
+{options}"""
+
+# 思考模式：回归/计数题
+REGRESSION_THINK_PROMPT = """\
+Please analyze the provided video carefully and answer the question.
+
+You MUST follow this exact format:
+<think>
+Your detailed step-by-step reasoning process here...
+</think>
+<answer>
+[your numeric answer]
+</answer>
+Output only a single number in the answer tags, with no additional text.
+
+Question: {question}"""
+
+# 直接回答模式：回归/计数题
+REGRESSION_DIRECT_PROMPT = """\
+Please analyze the provided video carefully and answer the question with a number.
+Output ONLY the number corresponding to your answer, with no explanation or other text.
+
+Question: {question}"""
+
+
+# ======================== 答案提取与评估 ========================
+
+def extract_gt_answer(solution: str) -> str:
+    """从 solution 字段提取标准答案（去除 XML 标签）"""
+    m = re.search(r"<answer>\s*(.*?)\s*</answer>", solution, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return solution.strip()
+
+
+def extract_pred_answer(response: str, answer_mode: str) -> str:
+    """
+    从模型输出中提取预测答案
+
+    think 模式：优先从 <answer> 标签提取
+    direct 模式：先尝试 <answer> 标签，再 fallback 到首个大写字母或数字
+    """
+    # 优先尝试 <answer> 标签（think 和 direct 模式都支持）
+    m = re.search(r"<answer>\s*(.*?)\s*</answer>", response, re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+
+    if answer_mode == "direct":
+        # fallback: 首个大写字母（多选题）
+        m = re.search(r"\b([A-J])\b", response)
+        if m:
+            return m.group(1)
+        # fallback: 首个数字（回归题）
+        m = re.search(r"\b(\d+(?:\.\d+)?)\b", response)
+        if m:
+            return m.group(1)
+
+    return ""
+
+
+def compute_accuracy(pred: str, gt: str, problem_type: str = "multiple choice") -> float:
+    """
+    计算单样本准确率
+
+    multiple choice: 字母精确匹配（大小写不敏感）
+    regression:      数值精确匹配（容忍 ±0.5，即整数计数完全匹配）
+    """
+    if not pred or not gt:
+        return 0.0
+
+    if problem_type == "regression":
+        try:
+            return 1.0 if abs(float(pred) - float(gt)) <= 0.5 else 0.0
+        except ValueError:
+            return 0.0
+    else:
+        return 1.0 if pred.strip().upper() == gt.strip().upper() else 0.0
+
+
+# ======================== 通用工具函数 ========================
+
+def _resolve_video_path(raw_path: str, video_base_dir: Optional[str]) -> str:
+    """解析视频路径：若为相对路径且指定了 base_dir，则拼接"""
+    if video_base_dir and not os.path.isabs(raw_path):
+        return os.path.join(video_base_dir, raw_path)
+    return raw_path
+
+
+def _video_content(video_path: str, fps: float, max_frames: int, max_pixels: Optional[int]) -> Dict:
+    """构造 messages 中的视频内容字典"""
+    content: Dict[str, Any] = {
+        "type": "video",
+        "video": video_path,
+        "fps": fps,
+        "max_frames": max_frames,
+    }
+    if max_pixels is not None:
+        content["max_pixels"] = max_pixels
+    return content
+
+
+def _mc_messages(
+    video_path: str,
+    prompt_text: str,
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+) -> List[Dict]:
+    """构造标准多选题单轮对话 messages"""
+    return [
+        {
+            "role": "user",
+            "content": [
+                _video_content(video_path, fps, max_frames, max_pixels),
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+
+def _regression_messages(
+    video_path: str,
+    prompt_text: str,
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+) -> List[Dict]:
+    """构造回归/计数题单轮对话 messages（与多选题结构相同，仅语义不同）"""
+    return [
+        {
+            "role": "user",
+            "content": [
+                _video_content(video_path, fps, max_frames, max_pixels),
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+
+
+# ======================== 各数据集构建函数 ========================
+
+def build_mmvu_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    MMVU — 科学领域视频多选题（最多 5 选项 A-E）
+
+    样本格式:
+        problem_id, problem, options (list), solution (<answer>X</answer>), path
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+    options_text = "\n".join(sample["options"])
+
+    tmpl = MC_THINK_PROMPT if answer_mode == "think" else MC_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"], options=options_text)
+
+    messages = _mc_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+def build_mvbench_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    MVBench — 动作/运动理解视频多选题（A-C，3 选项）
+
+    样本格式:
+        problem_id, problem, options (list), solution (<answer>X</answer>), path
+        额外字段: answer（选项全文）, subtitle
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+    options_text = "\n".join(sample["options"])
+
+    tmpl = MC_THINK_PROMPT if answer_mode == "think" else MC_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"], options=options_text)
+
+    messages = _mc_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+def build_tempcompass_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    TempCompass — 时序理解视频二选题（A-B）
+
+    样本格式:
+        problem_id, problem, options (list), solution (<answer>X</answer>), path
+        额外字段: dim（action/direction/...），用于按维度分析结果
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+    options_text = "\n".join(sample["options"])
+
+    tmpl = MC_THINK_PROMPT if answer_mode == "think" else MC_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"], options=options_text)
+
+    messages = _mc_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+def build_videomme_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    VideoMME — 通用视频理解多选题（A-D，分 short/medium/long 时长类别）
+
+    样本格式:
+        problem_id, problem, options (list), solution (<answer>X</answer>), path
+        额外字段: duration, domain, sub_category, task_type
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+    options_text = "\n".join(sample["options"])
+
+    tmpl = MC_THINK_PROMPT if answer_mode == "think" else MC_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"], options=options_text)
+
+    messages = _mc_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+def build_videommmu_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    VideoMMMU — 学术领域视频多选题（最多 10 选项 A-J）
+
+    样本格式:
+        problem_id, problem, options (list), solution (<answer>X</answer>), path
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+    options_text = "\n".join(sample["options"])
+
+    tmpl = MC_THINK_PROMPT if answer_mode == "think" else MC_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"], options=options_text)
+
+    messages = _mc_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+def build_vsibench_messages(
+    sample: Dict[str, Any],
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> Tuple[List[Dict], str, str]:
+    """
+    VSIBench — 空间理解视频回归题（物体计数，无选项，数值答案）
+
+    样本格式:
+        problem_id, problem, options (null), solution (<answer>N</answer>), path
+        problem_type = "regression"，答案为整数
+
+    准确率计算: |pred - gt| <= 0.5（即整数精确匹配）
+    """
+    video_path = _resolve_video_path(sample["path"], video_base_dir)
+
+    tmpl = REGRESSION_THINK_PROMPT if answer_mode == "think" else REGRESSION_DIRECT_PROMPT
+    prompt_text = tmpl.format(question=sample["problem"])
+
+    messages = _regression_messages(video_path, prompt_text, fps, max_frames, max_pixels)
+    gt_answer = extract_gt_answer(sample["solution"])
+    sample_id = str(sample.get("problem_id", ""))
+
+    return messages, gt_answer, sample_id
+
+
+# ======================== 数据集注册表 ========================
+
+DATASET_BUILDERS = {
+    "mmvu": build_mmvu_messages,
+    "mvbench": build_mvbench_messages,
+    "tempcompass": build_tempcompass_messages,
+    "videomme": build_videomme_messages,
+    "videommmu": build_videommmu_messages,
+    "vsibench": build_vsibench_messages,
+}
