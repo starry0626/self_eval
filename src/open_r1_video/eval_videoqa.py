@@ -117,14 +117,19 @@ def run_inference(
     processor,
     messages: list,
     max_new_tokens: int,
+    answer_mode: str = "think",
 ) -> str:
     """对单个样本运行推理，返回模型生成的文本（已去除输入部分）"""
     from qwen_vl_utils import process_vision_info
+
+    # direct 模式关闭模型内置思考能力，避免生成 <think> 块
+    enable_thinking = answer_mode != "direct"
 
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
+        enable_thinking=enable_thinking,
     )
 
     image_inputs, video_inputs, video_kwargs = process_vision_info(
@@ -216,7 +221,7 @@ def main():
                 answer_mode=args.answer_mode,
             )
 
-            response = run_inference(model, processor, messages, args.max_new_tokens)
+            response = run_inference(model, processor, messages, args.max_new_tokens, args.answer_mode)
             pred_answer = extract_pred_answer(response, args.answer_mode)
             correct = compute_accuracy(pred_answer, gt_answer, problem_type)
 

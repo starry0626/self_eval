@@ -133,9 +133,15 @@ def compute_accuracy(pred: str, gt: str, problem_type: str = "multiple choice") 
 # ======================== 通用工具函数 ========================
 
 def _resolve_video_path(raw_path: str, video_base_dir: Optional[str]) -> str:
-    """解析视频路径：若为相对路径且指定了 base_dir，则拼接"""
+    """
+    解析视频路径：若为相对路径且指定了 base_dir，则拼接并规范化。
+
+    数据集中的 path 字段通常以 "./" 开头（如 "./Evaluation/VideoMME/xxx.mp4"），
+    直接 os.path.join 会产生 "base/./Evaluation/..." 形式的冗余路径。
+    使用 os.path.normpath 消除中间的 "./" 和 ".."，确保路径干净。
+    """
     if video_base_dir and not os.path.isabs(raw_path):
-        return os.path.join(video_base_dir, raw_path)
+        return os.path.normpath(os.path.join(video_base_dir, raw_path))
     return raw_path
 
 
