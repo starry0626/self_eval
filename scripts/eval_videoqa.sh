@@ -48,6 +48,18 @@ MAX_NEW_TOKENS=1024
 ATTN_IMPLEMENTATION=flash_attention_2
 TORCH_DTYPE=bfloat16
 
+# ================= vLLM 推理配置 =================
+# 设置为 true 启用 vLLM 离线批量推理（速度更快）
+USE_VLLM=false
+# vLLM 张量并行 GPU 数
+TENSOR_PARALLEL_SIZE=1
+# vLLM GPU 显存利用率（0-1）
+GPU_MEMORY_UTILIZATION=0.80
+# vLLM 最大序列长度（留空使用模型默认值）
+MAX_MODEL_LEN=
+# vLLM 每批推理样本数
+VLLM_BATCH_SIZE=16
+
 # ================= 构建可选参数 =================
 OPTIONAL_ARGS=""
 if [ -n "$MAX_SAMPLES" ]; then
@@ -59,6 +71,15 @@ fi
 if [ "$CHECK_VIDEO_PATHS" = "true" ]; then
     OPTIONAL_ARGS="$OPTIONAL_ARGS --check_video_paths"
 fi
+if [ "$USE_VLLM" = "true" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --use_vllm"
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --tensor_parallel_size $TENSOR_PARALLEL_SIZE"
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --gpu_memory_utilization $GPU_MEMORY_UTILIZATION"
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --vllm_batch_size $VLLM_BATCH_SIZE"
+    if [ -n "$MAX_MODEL_LEN" ]; then
+        OPTIONAL_ARGS="$OPTIONAL_ARGS --max_model_len $MAX_MODEL_LEN"
+    fi
+fi
 
 # ================= 打印启动信息 =================
 echo "=========================================="
@@ -69,6 +90,15 @@ echo "  数据集:     $DATASET_TYPE"
 echo "  数据集路径: $DATASET_PATH"
 echo "  回答模式:   $ANSWER_MODE"
 echo "  输出:       $OUTPUT_DIR"
+if [ "$USE_VLLM" = "true" ]; then
+echo "  推理后端:   vLLM"
+echo "  张量并行:   $TENSOR_PARALLEL_SIZE"
+echo "  显存利用率: $GPU_MEMORY_UTILIZATION"
+echo "  最大序列长度: $MAX_MODEL_LEN"
+echo "  批量大小:   $VLLM_BATCH_SIZE"
+else
+echo "  推理后端:   HuggingFace Transformers"
+fi
 echo "=========================================="
 
 # ================= 启动命令 =================

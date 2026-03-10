@@ -83,6 +83,18 @@ def parse_args() -> argparse.Namespace:
                         choices=["bfloat16", "float16", "float32"],
                         help="模型加载精度")
 
+    # ---- vLLM 推理配置 ----
+    parser.add_argument("--use_vllm", action="store_true", default=False,
+                        help="使用 vLLM 进行推理（离线批量推理，速度更快）")
+    parser.add_argument("--tensor_parallel_size", type=int, default=1,
+                        help="vLLM 张量并行 GPU 数（默认 1）")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.80,
+                        help="vLLM GPU 显存利用率（0-1）")
+    parser.add_argument("--max_model_len", type=int, default=None,
+                        help="vLLM 最大序列长度（None 表示使用模型默认值）")
+    parser.add_argument("--vllm_batch_size", type=int, default=16,
+                        help="vLLM 批量推理时每批样本数")
+
     return parser.parse_args()
 
 
@@ -91,7 +103,7 @@ def load_model_and_processor(
     attn_implementation: str,
     torch_dtype_str: str,
 ):
-    """加载 Qwen3-VL 模型和处理器"""
+    """加载 Qwen3-VL 模型和处理器（HuggingFace Transformers）"""
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
     dtype_map = {
@@ -113,6 +125,36 @@ def load_model_and_processor(
     processor = AutoProcessor.from_pretrained(model_path)
     print(f"Model loaded. Devices: {set(str(p.device) for p in model.parameters())}")
     return model, processor
+
+
+def load_vllm_model(
+    model_path: str,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.80,
+    max_model_len: Optional[int] = None,
+):
+    """加载 Qwen3-VL 模型（vLLM 离线推理）"""
+    import os
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+    from transformers import AutoProcessor
+    from vllm import LLM
+
+    print(f"Loading vLLM model from {model_path} ...")
+    llm_kwargs = {
+        "model": model_path,
+        "trust_remote_code": True,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "tensor_parallel_size": tensor_parallel_size,
+        "limit_mm_per_prompt": {"video": 1},
+    }
+    if max_model_len is not None:
+        llm_kwargs["max_model_len"] = max_model_len
+
+    llm = LLM(**llm_kwargs)
+    processor = AutoProcessor.from_pretrained(model_path)
+    print(f"vLLM model loaded. tensor_parallel_size={tensor_parallel_size}")
+    return llm, processor
 
 
 def run_inference(
@@ -166,6 +208,58 @@ def run_inference(
     return response
 
 
+def prepare_vllm_input(
+    processor,
+    messages: list,
+    answer_mode: str = "think",
+) -> dict:
+    """将单个样本的 messages 转换为 vLLM 离线推理输入格式"""
+    from qwen_vl_utils import process_vision_info
+
+    enable_thinking = answer_mode != "direct"
+
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=enable_thinking,
+    )
+
+    image_inputs, video_inputs, video_kwargs = process_vision_info(
+        messages,
+        return_video_kwargs=True,
+    )
+
+    mm_data = {}
+    if image_inputs is not None:
+        mm_data["image"] = image_inputs
+    if video_inputs is not None:
+        mm_data["video"] = video_inputs
+
+    return {
+        "prompt": text,
+        "multi_modal_data": mm_data,
+        "mm_processor_kwargs": video_kwargs,
+    }
+
+
+def run_vllm_batch_inference(
+    llm,
+    vllm_inputs: list,
+    max_new_tokens: int,
+) -> list:
+    """使用 vLLM 对一批样本进行离线推理，返回生成文本列表"""
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_tokens=max_new_tokens,
+    )
+
+    outputs = llm.generate(vllm_inputs, sampling_params=sampling_params)
+    return [output.outputs[0].text for output in outputs]
+
+
 def main():
     args = parse_args()
 
@@ -183,8 +277,16 @@ def main():
     print(f"  最大帧数:      {args.max_frames}")
     print(f"  最大像素:      {args.max_pixels}")
     print(f"  最大生成长度:  {args.max_new_tokens}")
-    print(f"  注意力实现:    {args.attn_implementation}")
-    print(f"  精度:          {args.torch_dtype}")
+    if args.use_vllm:
+        print(f"  推理后端:      vLLM")
+        print(f"  张量并行:      {args.tensor_parallel_size}")
+        print(f"  显存利用率:    {args.gpu_memory_utilization}")
+        print(f"  最大序列长度:  {args.max_model_len}")
+        print(f"  批量大小:      {args.vllm_batch_size}")
+    else:
+        print(f"  推理后端:      HuggingFace Transformers")
+        print(f"  注意力实现:    {args.attn_implementation}")
+        print(f"  精度:          {args.torch_dtype}")
     print(f"  路径预检查:    {args.check_video_paths}")
     print("=" * 60)
 
@@ -204,9 +306,17 @@ def main():
         print(f"All {len(dataset)} video paths verified.")
 
     # 加载模型
-    model, processor = load_model_and_processor(
-        args.model_path, args.attn_implementation, args.torch_dtype
-    )
+    if args.use_vllm:
+        llm, processor = load_vllm_model(
+            args.model_path,
+            tensor_parallel_size=args.tensor_parallel_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+        )
+    else:
+        model, processor = load_model_and_processor(
+            args.model_path, args.attn_implementation, args.torch_dtype
+        )
 
     build_messages = DATASET_BUILDERS[args.dataset_type]
 
@@ -214,30 +324,63 @@ def main():
     results = []
     inference_times = []
 
-    for sample in tqdm(dataset, desc="Evaluating"):
-        t0 = time.time()
-        problem_type = sample.get("problem_type", "multiple choice")
-        # 提前获取 sample_id，方便异常时记录
-        sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
-        gt_answer = ""
+    if args.use_vllm:
+        # ---- vLLM 批量推理路径 ----
+        # 第一步：构建所有样本的 messages 和元数据
+        all_meta = []  # (sample_id, gt_answer, problem_type)
+        all_vllm_inputs = []
+        build_errors = []  # 构建失败的样本
 
-        try:
-            messages, gt_answer, sample_id = build_messages(
-                sample,
-                video_base_dir=args.video_base_dir,
-                fps=args.fps,
-                max_frames=args.max_frames,
-                max_pixels=args.max_pixels,
-                answer_mode=args.answer_mode,
-            )
+        for sample in tqdm(dataset, desc="Preparing inputs"):
+            problem_type = sample.get("problem_type", "multiple choice")
+            sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+            gt_answer = ""
 
-            response = run_inference(model, processor, messages, args.max_new_tokens, args.answer_mode)
+            try:
+                messages, gt_answer, sample_id = build_messages(
+                    sample,
+                    video_base_dir=args.video_base_dir,
+                    fps=args.fps,
+                    max_frames=args.max_frames,
+                    max_pixels=args.max_pixels,
+                    answer_mode=args.answer_mode,
+                )
+                vllm_input = prepare_vllm_input(processor, messages, args.answer_mode)
+                all_vllm_inputs.append(vllm_input)
+                all_meta.append((sample_id, gt_answer, problem_type))
+            except Exception as e:
+                import traceback
+                print(f"\n❌ Error preparing sample {sample_id}: {e}")
+                traceback.print_exc()
+                build_errors.append({
+                    "id": sample_id,
+                    "problem_type": problem_type,
+                    "ground_truth": gt_answer,
+                    "prediction": "",
+                    "correct": 0.0,
+                    "response": f"ERROR: {e}",
+                    "inference_time": 0.0,
+                })
+
+        # 第二步：分批进行 vLLM 推理
+        print(f"\nRunning vLLM batch inference on {len(all_vllm_inputs)} samples ...")
+        all_responses = []
+        batch_size = args.vllm_batch_size
+        t_total_start = time.time()
+
+        for batch_start in tqdm(range(0, len(all_vllm_inputs), batch_size), desc="vLLM inference"):
+            batch_inputs = all_vllm_inputs[batch_start : batch_start + batch_size]
+            batch_responses = run_vllm_batch_inference(llm, batch_inputs, args.max_new_tokens)
+            all_responses.extend(batch_responses)
+
+        t_total_elapsed = time.time() - t_total_start
+        avg_per_sample = t_total_elapsed / len(all_responses) if all_responses else 0.0
+
+        # 第三步：汇总结果
+        for i, response in enumerate(all_responses):
+            sample_id, gt_answer, problem_type = all_meta[i]
             pred_answer = extract_pred_answer(response, args.answer_mode)
             correct = compute_accuracy(pred_answer, gt_answer, problem_type)
-
-            elapsed = time.time() - t0
-            inference_times.append(elapsed)
-
             results.append({
                 "id": sample_id,
                 "problem_type": problem_type,
@@ -245,22 +388,60 @@ def main():
                 "prediction": pred_answer,
                 "correct": correct,
                 "response": response,
-                "inference_time": elapsed,
+                "inference_time": avg_per_sample,
             })
 
-        except Exception as e:
-            import traceback
-            print(f"\n❌ Error on sample {sample_id}: {e}")
-            traceback.print_exc()
-            results.append({
-                "id": sample_id,
-                "problem_type": problem_type,
-                "ground_truth": gt_answer,
-                "prediction": "",
-                "correct": 0.0,
-                "response": f"ERROR: {e}",
-                "inference_time": time.time() - t0,
-            })
+        results.extend(build_errors)
+        inference_times = [avg_per_sample] * len(all_responses)
+
+    else:
+        # ---- HuggingFace Transformers 逐样本推理路径 ----
+        for sample in tqdm(dataset, desc="Evaluating"):
+            t0 = time.time()
+            problem_type = sample.get("problem_type", "multiple choice")
+            sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+            gt_answer = ""
+
+            try:
+                messages, gt_answer, sample_id = build_messages(
+                    sample,
+                    video_base_dir=args.video_base_dir,
+                    fps=args.fps,
+                    max_frames=args.max_frames,
+                    max_pixels=args.max_pixels,
+                    answer_mode=args.answer_mode,
+                )
+
+                response = run_inference(model, processor, messages, args.max_new_tokens, args.answer_mode)
+                pred_answer = extract_pred_answer(response, args.answer_mode)
+                correct = compute_accuracy(pred_answer, gt_answer, problem_type)
+
+                elapsed = time.time() - t0
+                inference_times.append(elapsed)
+
+                results.append({
+                    "id": sample_id,
+                    "problem_type": problem_type,
+                    "ground_truth": gt_answer,
+                    "prediction": pred_answer,
+                    "correct": correct,
+                    "response": response,
+                    "inference_time": elapsed,
+                })
+
+            except Exception as e:
+                import traceback
+                print(f"\n❌ Error on sample {sample_id}: {e}")
+                traceback.print_exc()
+                results.append({
+                    "id": sample_id,
+                    "problem_type": problem_type,
+                    "ground_truth": gt_answer,
+                    "prediction": "",
+                    "correct": 0.0,
+                    "response": f"ERROR: {e}",
+                    "inference_time": time.time() - t0,
+                })
 
     # 统计
     total = len(results)
@@ -286,6 +467,7 @@ def main():
         "dataset_type": args.dataset_type,
         "dataset_path": args.dataset_path,
         "answer_mode": args.answer_mode,
+        "inference_backend": "vllm" if args.use_vllm else "transformers",
         "total_samples": total,
         "correct": int(correct_count),
         "accuracy": accuracy,
