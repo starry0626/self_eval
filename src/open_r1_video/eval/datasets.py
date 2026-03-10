@@ -132,17 +132,25 @@ def compute_accuracy(pred: str, gt: str, problem_type: str = "multiple choice") 
 
 # ======================== 通用工具函数 ========================
 
-def _resolve_video_path(raw_path: str, video_base_dir: Optional[str]) -> str:
+def _resolve_video_path(raw_path: str, video_base_dir: Optional[str], check_exists: bool = False) -> str:
     """
     解析视频路径：若为相对路径且指定了 base_dir，则拼接并规范化。
 
     数据集中的 path 字段通常以 "./" 开头（如 "./Evaluation/VideoMME/xxx.mp4"），
     直接 os.path.join 会产生 "base/./Evaluation/..." 形式的冗余路径。
     使用 os.path.normpath 消除中间的 "./" 和 ".."，确保路径干净。
+
+    check_exists: 若为 True，检查路径是否存在，不存在则抛出 FileNotFoundError。
     """
     if video_base_dir and not os.path.isabs(raw_path):
-        return os.path.normpath(os.path.join(video_base_dir, raw_path))
-    return raw_path
+        resolved = os.path.normpath(os.path.join(video_base_dir, raw_path))
+    else:
+        resolved = raw_path
+
+    if check_exists and not os.path.exists(resolved):
+        raise FileNotFoundError(f"视频文件不存在: {resolved}")
+
+    return resolved
 
 
 def _video_content(video_path: str, fps: float, max_frames: int, max_pixels: Optional[int]) -> Dict:
@@ -375,3 +383,25 @@ DATASET_BUILDERS = {
     "videommmu": build_videommmu_messages,
     "vsibench": build_vsibench_messages,
 }
+
+
+def check_video_paths(dataset: List[Dict], video_base_dir: Optional[str]) -> None:
+    """
+    预检查数据集中所有视频路径是否存在。
+
+    在模型加载之前调用，提前发现缺失的视频文件，
+    避免模型加载完成后才因文件不存在而报错。
+    """
+    missing = []
+    for sample in dataset:
+        resolved = _resolve_video_path(sample["path"], video_base_dir)
+        if not os.path.exists(resolved):
+            missing.append(resolved)
+
+    if missing:
+        msg = f"视频路径检查失败: {len(missing)} 个文件不存在\n"
+        for p in missing[:20]:
+            msg += f"  - {p}\n"
+        if len(missing) > 20:
+            msg += f"  ... 及其他 {len(missing) - 20} 个文件\n"
+        raise FileNotFoundError(msg)

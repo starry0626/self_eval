@@ -33,6 +33,7 @@ from tqdm import tqdm
 
 from open_r1_video.eval.datasets import (
     DATASET_BUILDERS,
+    check_video_paths,
     compute_accuracy,
     extract_pred_answer,
 )
@@ -62,6 +63,8 @@ def parse_args() -> argparse.Namespace:
                         help="回答模式：think（先思考后回答）或 direct（直接回答）")
     parser.add_argument("--max_samples", type=int, default=None,
                         help="最大评估样本数（None 表示评估全部）")
+    parser.add_argument("--check_video_paths", action="store_true", default=False,
+                        help="加载模型前预检查所有视频路径是否存在，不存在则报错退出")
 
     # ---- 视频处理配置 ----
     parser.add_argument("--fps", type=float, default=1.0,
@@ -182,14 +185,10 @@ def main():
     print(f"  最大生成长度:  {args.max_new_tokens}")
     print(f"  注意力实现:    {args.attn_implementation}")
     print(f"  精度:          {args.torch_dtype}")
+    print(f"  路径预检查:    {args.check_video_paths}")
     print("=" * 60)
 
-    # 加载模型
-    model, processor = load_model_and_processor(
-        args.model_path, args.attn_implementation, args.torch_dtype
-    )
-
-    # 加载数据集
+    # 加载数据集（在模型之前加载，以便预检查路径）
     print(f"\nLoading dataset from {args.dataset_path} ...")
     with open(args.dataset_path, "r", encoding="utf-8") as f:
         dataset = json.load(f)
@@ -197,6 +196,17 @@ def main():
     if args.max_samples is not None:
         dataset = dataset[: args.max_samples]
     print(f"Dataset loaded: {len(dataset)} samples")
+
+    # 视频路径预检查（在加载模型之前，避免模型加载完才发现路径错误）
+    if args.check_video_paths:
+        print("\nChecking video paths ...")
+        check_video_paths(dataset, args.video_base_dir)
+        print(f"All {len(dataset)} video paths verified.")
+
+    # 加载模型
+    model, processor = load_model_and_processor(
+        args.model_path, args.attn_implementation, args.torch_dtype
+    )
 
     build_messages = DATASET_BUILDERS[args.dataset_type]
 

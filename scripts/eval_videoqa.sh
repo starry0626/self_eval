@@ -32,6 +32,9 @@ ANSWER_MODE=think
 # 留空则评估全部样本
 MAX_SAMPLES=
 
+# 是否在加载模型前预检查所有视频路径（true/留空）
+CHECK_VIDEO_PATHS=true
+
 # ================= 视频处理配置 =================
 FPS=1.0
 MAX_FRAMES=32
@@ -52,6 +55,9 @@ if [ -n "$MAX_SAMPLES" ]; then
 fi
 if [ -n "$MAX_PIXELS" ]; then
     OPTIONAL_ARGS="$OPTIONAL_ARGS --max_pixels $MAX_PIXELS"
+fi
+if [ "$CHECK_VIDEO_PATHS" = "true" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --check_video_paths"
 fi
 
 # ================= 打印启动信息 =================
