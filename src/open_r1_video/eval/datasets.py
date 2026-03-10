@@ -385,12 +385,14 @@ DATASET_BUILDERS = {
 }
 
 
-def check_video_paths(dataset: List[Dict], video_base_dir: Optional[str]) -> None:
+def check_video_paths(dataset: List[Dict], video_base_dir: Optional[str], output_dir: Optional[str] = None) -> None:
     """
     预检查数据集中所有视频路径是否存在。
 
     在模型加载之前调用，提前发现缺失的视频文件，
     避免模型加载完成后才因文件不存在而报错。
+
+    若指定 output_dir，会将所有缺失路径写入 output_dir/missing_videos.txt。
     """
     missing = []
     for sample in dataset:
@@ -399,6 +401,15 @@ def check_video_paths(dataset: List[Dict], video_base_dir: Optional[str]) -> Non
             missing.append(resolved)
 
     if missing:
+        # 将完整的缺失路径列表写入文件
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            missing_file = os.path.join(output_dir, "missing_videos.txt")
+            with open(missing_file, "w", encoding="utf-8") as f:
+                for p in missing:
+                    f.write(p + "\n")
+            print(f"完整缺失路径列表已写入: {missing_file}")
+
         msg = f"视频路径检查失败: {len(missing)} 个文件不存在\n"
         for p in missing[:20]:
             msg += f"  - {p}\n"

@@ -200,7 +200,7 @@ def main():
     # 视频路径预检查（在加载模型之前，避免模型加载完才发现路径错误）
     if args.check_video_paths:
         print("\nChecking video paths ...")
-        check_video_paths(dataset, args.video_base_dir)
+        check_video_paths(dataset, args.video_base_dir, output_dir=args.output_dir)
         print(f"All {len(dataset)} video paths verified.")
 
     # 加载模型
