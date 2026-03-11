@@ -29,7 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # 思考模式：多选题
 MC_THINK_PROMPT = """\
-Please analyze the provided video carefully and answer the multiple-choice question.
+Please analyze the provided video carefully and answer the multiple-choice question strictly based on the content of the video.
 
 You MUST follow this exact format:
 <think>
@@ -46,8 +46,16 @@ Options:
 
 # 直接回答模式：多选题
 MC_DIRECT_PROMPT = """\
-Please analyze the provided video carefully and answer the multiple-choice question.
-Output ONLY the single option letter (A, B, C, D, etc.) corresponding to your answer, with no explanation or other text.
+Please analyze the provided video and answer the multiple-choice question strictly based on the content of the video.
+
+You MUST follow this exact format:
+<think>
+Your analysis here...
+</think>
+<answer>
+X
+</answer>
+where X is the single option letter (A, B, C, D, etc.) with no additional text.
 
 Question: {question}
 Options:
@@ -55,7 +63,7 @@ Options:
 
 # 思考模式：回归/计数题
 REGRESSION_THINK_PROMPT = """\
-Please analyze the provided video carefully and answer the question.
+Please analyze the provided video carefully and answer the question strictly based on the content of the video.
 
 You MUST follow this exact format:
 <think>
@@ -70,8 +78,16 @@ Question: {question}"""
 
 # 直接回答模式：回归/计数题
 REGRESSION_DIRECT_PROMPT = """\
-Please analyze the provided video carefully and answer the question with a number.
-Output ONLY the number corresponding to your answer, with no explanation or other text.
+Please analyze the provided video carefully and answer the question with a number strictly based on the content of the video.
+
+You MUST follow this exact format:
+<think>
+Your analysis here...
+</think>
+<answer>
+[your numeric answer]
+</answer>
+Output only a single number in the answer tags, with no additional text.
 
 Question: {question}"""
 

@@ -156,6 +156,18 @@ def load_vllm_model(
     return llm, processor
 
 
+def _append_skip_thinking(text: str) -> str:
+    """在 apply_chat_template 生成的 prompt 末尾追加已完成的思考块，
+    诱导模型跳过思考阶段直接输出答案。
+
+    apply_chat_template(enable_thinking=True, add_generation_prompt=True)
+    生成的 prompt 以 ``<|im_start|>assistant\\n<think>\\n`` 结尾，
+    本函数在其后追加一段简短的"思考完毕"文本并关闭 </think> 标签，
+    使模型认为思考已经结束，从而直接生成最终答案。
+    """
+    return text + "Okay, this is straightforward. Here is the final answer.\n</think>\n\n"
+
+
 def run_inference(
     model,
     processor,
@@ -166,15 +178,14 @@ def run_inference(
     """对单个样本运行推理，返回模型生成的文本（已去除输入部分）"""
     from qwen_vl_utils import process_vision_info
 
-    # direct 模式关闭模型内置思考能力，避免生成 <think> 块
-    enable_thinking = answer_mode != "direct"
-
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=enable_thinking,
+        enable_thinking=True,
     )
+    if answer_mode == "direct":
+        text = _append_skip_thinking(text)
 
     image_inputs, video_inputs, video_kwargs = process_vision_info(
         messages,
@@ -215,14 +226,14 @@ def prepare_vllm_input(
     """将单个样本的 messages 转换为 vLLM 离线推理输入格式"""
     from qwen_vl_utils import process_vision_info
 
-    enable_thinking = answer_mode != "direct"
-
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
-        enable_thinking=enable_thinking,
+        enable_thinking=True,
     )
+    if answer_mode == "direct":
+        text = _append_skip_thinking(text)
 
     image_inputs, video_inputs, video_kwargs = process_vision_info(
         messages,

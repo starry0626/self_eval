@@ -30,7 +30,7 @@ mkdir -p "$OUTPUT_DIR"
 ANSWER_MODE=direct
 
 # 留空则评估全部样本
-MAX_SAMPLES=
+MAX_SAMPLES=10
 
 # 是否在加载模型前预检查所有视频路径（true/留空）
 CHECK_VIDEO_PATHS=
