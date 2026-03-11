@@ -11,14 +11,14 @@ CUDA_VISIBLE_DEVICES=0
 export CUDA_VISIBLE_DEVICES
 
 # ================= 路径配置 =================
-MODEL_PATH="./Qwen3-VL-2B-Thinking"
+MODEL_PATH="output/sdpo/checkpoint-63"
 
 # 数据集类型: mmvu / mvbench / tempcompass / videomme / videommmu / vsibench
-DATASET_TYPE="videomme"
+DATASET_TYPE="tempcompass"
 DATASET_PATH="./src/open_r1_video/eval/eval_${DATASET_TYPE}.json"
 
 # 视频根目录，用于解析数据集中的相对路径（如 ./Evaluation/VideoMME/xxx.mp4）
-VIDEO_BASE_DIR="./video_data"
+VIDEO_BASE_DIR="data"
 
 OUTPUT_DIR="./output/eval/${DATASET_TYPE}/$(basename $MODEL_PATH)"
 
@@ -27,13 +27,13 @@ mkdir -p "$OUTPUT_DIR"
 # ================= 评估配置 =================
 # think:  先思考后回答，从 <answer> XML 标签提取最终答案
 # direct: 直接输出字母/数字，优先尝试 <answer> 标签，再 fallback
-ANSWER_MODE=think
+ANSWER_MODE=direct
 
 # 留空则评估全部样本
 MAX_SAMPLES=
 
 # 是否在加载模型前预检查所有视频路径（true/留空）
-CHECK_VIDEO_PATHS=true
+CHECK_VIDEO_PATHS=
 
 # ================= 视频处理配置 =================
 FPS=1.0
@@ -50,7 +50,7 @@ TORCH_DTYPE=bfloat16
 
 # ================= vLLM 推理配置 =================
 # 设置为 true 启用 vLLM 离线批量推理（速度更快）
-USE_VLLM=false
+USE_VLLM=true
 # vLLM 张量并行 GPU 数
 TENSOR_PARALLEL_SIZE=1
 # vLLM GPU 显存利用率（0-1）

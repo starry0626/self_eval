@@ -122,7 +122,7 @@ def load_model_and_processor(
     )
     model.eval()
 
-    processor = AutoProcessor.from_pretrained(model_path)
+    processor = AutoProcessor.from_pretrained(model_path, fix_mistral_regex=True)
     print(f"Model loaded. Devices: {set(str(p.device) for p in model.parameters())}")
     return model, processor
 
@@ -152,7 +152,7 @@ def load_vllm_model(
         llm_kwargs["max_model_len"] = max_model_len
 
     llm = LLM(**llm_kwargs)
-    processor = AutoProcessor.from_pretrained(model_path)
+    processor = AutoProcessor.from_pretrained(model_path, fix_mistral_regex=True)
     print(f"vLLM model loaded. tensor_parallel_size={tensor_parallel_size}")
     return llm, processor
 
