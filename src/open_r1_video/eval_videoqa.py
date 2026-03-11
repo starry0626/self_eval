@@ -143,7 +143,6 @@ def load_vllm_model(
     print(f"Loading vLLM model from {model_path} ...")
     llm_kwargs = {
         "model": model_path,
-        "trust_remote_code": True,
         "gpu_memory_utilization": gpu_memory_utilization,
         "tensor_parallel_size": tensor_parallel_size,
         "limit_mm_per_prompt": {"video": 1},
@@ -228,6 +227,8 @@ def prepare_vllm_input(
     image_inputs, video_inputs, video_kwargs = process_vision_info(
         messages,
         return_video_kwargs=True,
+        return_video_metadata=True,
+        image_patch_size=processor.image_processor.patch_size,
     )
 
     mm_data = {}
