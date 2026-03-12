@@ -146,6 +146,8 @@ def load_vllm_model(
         "gpu_memory_utilization": gpu_memory_utilization,
         "tensor_parallel_size": tensor_parallel_size,
         "limit_mm_per_prompt": {"video": 1},
+        "mm_processor_cache_gb": 0,
+        "enable_prefix_caching": False,
     }
     if max_model_len is not None:
         llm_kwargs["max_model_len"] = max_model_len
@@ -337,74 +339,85 @@ def main():
     inference_times = []
 
     if args.use_vllm:
-        # ---- vLLM 批量推理路径 ----
-        # 第一步：构建所有样本的 messages 和元数据
-        all_meta = []  # (sample_id, gt_answer, problem_type)
-        all_vllm_inputs = []
-        build_errors = []  # 构建失败的样本
+        # ---- vLLM 分块推理路径（边预处理边推理，避免内存堆积） ----
+        import gc
 
-        for sample in tqdm(dataset, desc="Preparing inputs"):
-            problem_type = sample.get("problem_type", "multiple choice")
-            sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
-            gt_answer = ""
-
-            try:
-                messages, gt_answer, sample_id = build_messages(
-                    sample,
-                    video_base_dir=args.video_base_dir,
-                    fps=args.fps,
-                    max_frames=args.max_frames,
-                    max_pixels=args.max_pixels,
-                    answer_mode=args.answer_mode,
-                )
-                vllm_input = prepare_vllm_input(processor, messages, args.answer_mode)
-                all_vllm_inputs.append(vllm_input)
-                all_meta.append((sample_id, gt_answer, problem_type))
-            except Exception as e:
-                import traceback
-                print(f"\n❌ Error preparing sample {sample_id}: {e}")
-                traceback.print_exc()
-                build_errors.append({
-                    "id": sample_id,
-                    "problem_type": problem_type,
-                    "ground_truth": gt_answer,
-                    "prediction": "",
-                    "correct": 0.0,
-                    "response": f"ERROR: {e}",
-                    "inference_time": 0.0,
-                })
-
-        # 第二步：分批进行 vLLM 推理
-        print(f"\nRunning vLLM batch inference on {len(all_vllm_inputs)} samples ...")
-        all_responses = []
         batch_size = args.vllm_batch_size
-        t_total_start = time.time()
+        total_samples = len(dataset)
+        num_chunks = (total_samples + batch_size - 1) // batch_size
 
-        for batch_start in tqdm(range(0, len(all_vllm_inputs), batch_size), desc="vLLM inference"):
-            batch_inputs = all_vllm_inputs[batch_start : batch_start + batch_size]
-            batch_responses = run_vllm_batch_inference(llm, batch_inputs, args.max_new_tokens)
-            all_responses.extend(batch_responses)
+        print(f"\nRunning vLLM chunked inference: {total_samples} samples, "
+              f"batch_size={batch_size}, {num_chunks} chunks")
+
+        t_total_start = time.time()
+        total_inferred = 0
+
+        for chunk_start in tqdm(range(0, total_samples, batch_size), desc="vLLM inference", total=num_chunks):
+            chunk_samples = dataset[chunk_start : chunk_start + batch_size]
+
+            # 对当前 chunk 预处理 + 推理
+            chunk_inputs = []
+            chunk_meta = []
+            for sample in chunk_samples:
+                problem_type = sample.get("problem_type", "multiple choice")
+                sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+                gt_answer = ""
+
+                try:
+                    messages, gt_answer, sample_id = build_messages(
+                        sample,
+                        video_base_dir=args.video_base_dir,
+                        fps=args.fps,
+                        max_frames=args.max_frames,
+                        max_pixels=args.max_pixels,
+                        answer_mode=args.answer_mode,
+                    )
+                    vllm_input = prepare_vllm_input(processor, messages, args.answer_mode)
+                    chunk_inputs.append(vllm_input)
+                    chunk_meta.append((sample_id, gt_answer, problem_type))
+                except Exception as e:
+                    import traceback
+                    print(f"\n❌ Error preparing sample {sample_id}: {e}")
+                    traceback.print_exc()
+                    results.append({
+                        "id": sample_id,
+                        "problem_type": problem_type,
+                        "ground_truth": gt_answer,
+                        "prediction": "",
+                        "correct": 0.0,
+                        "response": f"ERROR: {e}",
+                        "inference_time": 0.0,
+                    })
+
+            if chunk_inputs:
+                chunk_responses = run_vllm_batch_inference(llm, chunk_inputs, args.max_new_tokens)
+                total_inferred += len(chunk_responses)
+
+                for j, response in enumerate(chunk_responses):
+                    sample_id, gt_answer, problem_type = chunk_meta[j]
+                    pred_answer = extract_pred_answer(response, args.answer_mode)
+                    correct = compute_accuracy(pred_answer, gt_answer, problem_type)
+                    results.append({
+                        "id": sample_id,
+                        "problem_type": problem_type,
+                        "ground_truth": gt_answer,
+                        "prediction": pred_answer,
+                        "correct": correct,
+                        "response": response,
+                    })
+
+            # 释放当前 chunk 的视频数据，防止内存堆积
+            del chunk_inputs, chunk_meta
+            gc.collect()
 
         t_total_elapsed = time.time() - t_total_start
-        avg_per_sample = t_total_elapsed / len(all_responses) if all_responses else 0.0
+        avg_per_sample = t_total_elapsed / total_inferred if total_inferred else 0.0
 
-        # 第三步：汇总结果
-        for i, response in enumerate(all_responses):
-            sample_id, gt_answer, problem_type = all_meta[i]
-            pred_answer = extract_pred_answer(response, args.answer_mode)
-            correct = compute_accuracy(pred_answer, gt_answer, problem_type)
-            results.append({
-                "id": sample_id,
-                "problem_type": problem_type,
-                "ground_truth": gt_answer,
-                "prediction": pred_answer,
-                "correct": correct,
-                "response": response,
-                "inference_time": avg_per_sample,
-            })
-
-        results.extend(build_errors)
-        inference_times = [avg_per_sample] * len(all_responses)
+        # 回填推理时间
+        for r in results:
+            if "inference_time" not in r:
+                r["inference_time"] = avg_per_sample
+        inference_times = [avg_per_sample] * total_inferred
 
     else:
         # ---- HuggingFace Transformers 逐样本推理路径 ----

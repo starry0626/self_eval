@@ -30,17 +30,17 @@ mkdir -p "$OUTPUT_DIR"
 ANSWER_MODE=direct
 
 # 留空则评估全部样本
-MAX_SAMPLES=10
+MAX_SAMPLES=
 
 # 是否在加载模型前预检查所有视频路径（true/留空）
 CHECK_VIDEO_PATHS=
 
 # ================= 视频处理配置 =================
 FPS=1.0
-MAX_FRAMES=32
+MAX_FRAMES=64
 
 # 留空则使用处理器默认值
-MAX_PIXELS=
+MAX_PIXELS=262144   # 256 * 32 * 32
 
 # ================= 模型推理配置 =================
 # think 模式推理链较长，建议适当调大（如 2048）
