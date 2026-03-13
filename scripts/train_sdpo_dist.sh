@@ -155,6 +155,7 @@ torchrun \
     --learning_rate $LEARNING_RATE \
     --beta $BETA \
     --warmup_ratio $WARMUP_RATIO \
+    --lr_scheduler_type constant \
     \
     `# 批次大小` \
     --per_device_train_batch_size $PER_DEVICE_TRAIN_BATCH_SIZE \

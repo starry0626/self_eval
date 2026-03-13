@@ -594,12 +594,14 @@ def main():
     correct_count = sum(r["correct"] for r in results)
     accuracy = correct_count / total if total > 0 else 0.0
     avg_time = sum(inference_times) / len(inference_times) if inference_times else 0.0
+    no_answer_count = sum(1 for r in results if not r["prediction"])
 
     print("\n" + "=" * 60)
     print("评估结果")
     print("=" * 60)
     print(f"  总样本数:      {total}")
     print(f"  正确数:        {int(correct_count)}")
+    print(f"  未提取到答案:  {no_answer_count}")
     print(f"  准确率:        {accuracy:.4f}  ({accuracy * 100:.2f}%)")
     print(f"  平均推理时间:  {avg_time:.2f} s/sample")
     print("=" * 60)
@@ -616,6 +618,7 @@ def main():
         "inference_backend": "vllm" if args.use_vllm else "transformers",
         "total_samples": total,
         "correct": int(correct_count),
+        "no_answer": no_answer_count,
         "accuracy": accuracy,
         "avg_inference_time_sec": avg_time,
     }
