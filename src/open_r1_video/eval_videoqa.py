@@ -274,6 +274,133 @@ def run_vllm_batch_inference(
     return [output.outputs[0].text for output in outputs]
 
 
+def _preprocess_chunk(
+    chunk_samples: list,
+    build_messages_fn,
+    processor,
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+) -> tuple:
+    """预处理单个 chunk：视频解码 + 构建 vLLM 输入。
+
+    Returns:
+        (vllm_inputs, chunk_meta, error_results) 三元组
+    """
+    chunk_inputs = []
+    chunk_meta = []   # list of (sample_id, gt_answer, problem_type)
+    error_results = []
+
+    for sample in chunk_samples:
+        problem_type = sample.get("problem_type", "multiple choice")
+        sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+        gt_answer = ""
+
+        try:
+            messages, gt_answer, sample_id = build_messages_fn(
+                sample,
+                video_base_dir=video_base_dir,
+                fps=fps,
+                max_frames=max_frames,
+                max_pixels=max_pixels,
+                answer_mode=answer_mode,
+            )
+            vllm_input = prepare_vllm_input(processor, messages, answer_mode)
+            chunk_inputs.append(vllm_input)
+            chunk_meta.append((sample_id, gt_answer, problem_type))
+        except Exception as e:
+            import traceback
+            print(f"\n Error preparing sample {sample_id}: {e}")
+            traceback.print_exc()
+            error_results.append({
+                "id": sample_id,
+                "problem_type": problem_type,
+                "ground_truth": gt_answer,
+                "prediction": "",
+                "correct": 0.0,
+                "response": f"ERROR: {e}",
+                "inference_time": 0.0,
+            })
+
+    return chunk_inputs, chunk_meta, error_results
+
+
+def _prefetch_chunks(
+    dataset: list,
+    batch_size: int,
+    build_messages_fn,
+    processor,
+    video_base_dir: Optional[str],
+    fps: float,
+    max_frames: int,
+    max_pixels: Optional[int],
+    answer_mode: str,
+    prefetch_count: int = 1,
+):
+    """后台线程预取生成器：预处理 chunk N+1 的视频数据，与 chunk N 的 GPU 推理并行。
+
+    类似训练脚本中的 BatchPrefetcher，使用生产者-消费者模式：
+
+        [后台线程] 视频解码+预处理 ──► Queue ──► [主线程] vLLM GPU 推理
+              chunk N+1                              chunk N
+
+    Args:
+        prefetch_count: 预取队列容量。1 = 提前准备 1 个 chunk，
+                        峰值内存为 2 个 chunk 的视频数据。
+
+    Yields:
+        (chunk_inputs, chunk_meta, error_results) 三元组
+    """
+    import queue as _queue
+    import threading
+
+    total = len(dataset)
+    q = _queue.Queue(maxsize=prefetch_count)
+    stop_event = threading.Event()
+    _DONE = object()
+
+    def producer():
+        try:
+            for start in range(0, total, batch_size):
+                if stop_event.is_set():
+                    return
+                chunk_samples = dataset[start : start + batch_size]
+                try:
+                    result = _preprocess_chunk(
+                        chunk_samples, build_messages_fn, processor,
+                        video_base_dir, fps, max_frames, max_pixels, answer_mode,
+                    )
+                    q.put(result)
+                except Exception as e:
+                    q.put(e)
+                    return
+        finally:
+            q.put(_DONE)
+
+    thread = threading.Thread(target=producer, daemon=True)
+    thread.start()
+
+    try:
+        while True:
+            item = q.get()
+            if item is _DONE:
+                break
+            if isinstance(item, Exception):
+                stop_event.set()
+                raise item
+            yield item
+    finally:
+        stop_event.set()
+        while not q.empty():
+            try:
+                q.get_nowait()
+            except _queue.Empty:
+                break
+        thread.join(timeout=10)
+
+
 def main():
     args = parse_args()
 
@@ -339,55 +466,32 @@ def main():
     inference_times = []
 
     if args.use_vllm:
-        # ---- vLLM 分块推理路径（边预处理边推理，避免内存堆积） ----
+        # ---- vLLM 流水线推理路径 ----
+        # 后台线程预处理 chunk N+1 的视频，同时主线程对 chunk N 进行 GPU 推理
+        # 类似训练脚本 BatchPrefetcher 的生产者-消费者模式
         import gc
 
         batch_size = args.vllm_batch_size
         total_samples = len(dataset)
         num_chunks = (total_samples + batch_size - 1) // batch_size
 
-        print(f"\nRunning vLLM chunked inference: {total_samples} samples, "
-              f"batch_size={batch_size}, {num_chunks} chunks")
+        print(f"\nRunning vLLM pipelined inference: {total_samples} samples, "
+              f"batch_size={batch_size}, {num_chunks} chunks (prefetch=1)")
 
         t_total_start = time.time()
         total_inferred = 0
 
-        for chunk_start in tqdm(range(0, total_samples, batch_size), desc="vLLM inference", total=num_chunks):
-            chunk_samples = dataset[chunk_start : chunk_start + batch_size]
+        prefetcher = _prefetch_chunks(
+            dataset, batch_size, build_messages, processor,
+            args.video_base_dir, args.fps, args.max_frames,
+            args.max_pixels, args.answer_mode,
+        )
 
-            # 对当前 chunk 预处理 + 推理
-            chunk_inputs = []
-            chunk_meta = []
-            for sample in chunk_samples:
-                problem_type = sample.get("problem_type", "multiple choice")
-                sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
-                gt_answer = ""
-
-                try:
-                    messages, gt_answer, sample_id = build_messages(
-                        sample,
-                        video_base_dir=args.video_base_dir,
-                        fps=args.fps,
-                        max_frames=args.max_frames,
-                        max_pixels=args.max_pixels,
-                        answer_mode=args.answer_mode,
-                    )
-                    vllm_input = prepare_vllm_input(processor, messages, args.answer_mode)
-                    chunk_inputs.append(vllm_input)
-                    chunk_meta.append((sample_id, gt_answer, problem_type))
-                except Exception as e:
-                    import traceback
-                    print(f"\n❌ Error preparing sample {sample_id}: {e}")
-                    traceback.print_exc()
-                    results.append({
-                        "id": sample_id,
-                        "problem_type": problem_type,
-                        "ground_truth": gt_answer,
-                        "prediction": "",
-                        "correct": 0.0,
-                        "response": f"ERROR: {e}",
-                        "inference_time": 0.0,
-                    })
+        for chunk_inputs, chunk_meta, error_results in tqdm(
+            prefetcher, desc="vLLM inference", total=num_chunks
+        ):
+            # 收集预处理阶段的错误
+            results.extend(error_results)
 
             if chunk_inputs:
                 chunk_responses = run_vllm_batch_inference(llm, chunk_inputs, args.max_new_tokens)
@@ -407,7 +511,7 @@ def main():
                     })
 
             # 释放当前 chunk 的视频数据，防止内存堆积
-            del chunk_inputs, chunk_meta
+            del chunk_inputs, chunk_meta, error_results
             gc.collect()
 
         t_total_elapsed = time.time() - t_total_start
