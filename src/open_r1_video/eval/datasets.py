@@ -31,6 +31,10 @@ from typing import Any, Dict, List, Optional, Tuple
 MC_THINK_PROMPT = """\
 Please analyze the provided video carefully and answer the multiple-choice question strictly based on the content of the video.
 
+You MUST first provide a detailed step-by-step reasoning process within the <think> and </think> tags.
+You MUST then provide your final answer within the <answer> and </answer> tags.
+The <answer> tag must contain ONLY the single option letter (e.g., A, B, C, or D) with no other text or explanation.
+
 You MUST follow this exact format:
 <think>
 Your detailed step-by-step reasoning process here...
@@ -102,17 +106,31 @@ def extract_gt_answer(solution: str) -> str:
     return solution.strip()
 
 
-def extract_pred_answer(response: str, answer_mode: str) -> str:
+def extract_pred_answer(response: str, answer_mode: str, problem_type: str = "multiple choice") -> str:
     """
     从模型输出中提取预测答案
 
-    think 模式：优先从 <answer> 标签提取
+    think 模式：优先从 <answer> 标签提取，fallback 到 </think> 之后的文本
     direct 模式：先尝试 <answer> 标签，再 fallback 到首个大写字母或数字
     """
     # 优先尝试 <answer> 标签（think 和 direct 模式都支持）
     m = re.search(r"<answer>\s*(.*?)\s*</answer>", response, re.DOTALL | re.IGNORECASE)
     if m:
         return m.group(1).strip()
+
+    if answer_mode == "think":
+        # fallback: 从 </think> 之后的文本中提取答案
+        think_end = re.search(r"</think>\s*", response, re.IGNORECASE)
+        if think_end:
+            after_think = response[think_end.end():]
+            if problem_type == "regression":
+                m = re.search(r"\b(\d+(?:\.\d+)?)\b", after_think)
+                if m:
+                    return m.group(1)
+            else:
+                m = re.search(r"\b([A-J])\b", after_think)
+                if m:
+                    return m.group(1)
 
     if answer_mode == "direct":
         # fallback: 首个大写字母（多选题）

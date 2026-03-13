@@ -499,7 +499,7 @@ def main():
 
                 for j, response in enumerate(chunk_responses):
                     sample_id, gt_answer, problem_type = chunk_meta[j]
-                    pred_answer = extract_pred_answer(response, args.answer_mode)
+                    pred_answer = extract_pred_answer(response, args.answer_mode, problem_type)
                     correct = compute_accuracy(pred_answer, gt_answer, problem_type)
                     results.append({
                         "id": sample_id,
@@ -542,7 +542,7 @@ def main():
                 )
 
                 response = run_inference(model, processor, messages, args.max_new_tokens, args.answer_mode)
-                pred_answer = extract_pred_answer(response, args.answer_mode)
+                pred_answer = extract_pred_answer(response, args.answer_mode, problem_type)
                 correct = compute_accuracy(pred_answer, gt_answer, problem_type)
 
                 elapsed = time.time() - t0
