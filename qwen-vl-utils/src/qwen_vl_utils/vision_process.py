@@ -407,6 +407,9 @@ def fetch_video(ele: Dict[str, Any], image_patch_size: int = 14, return_video_sa
     VIDEO_FRAME_MAX_PIXELS = VIDEO_MAX_TOKEN_NUM * image_factor * image_factor
     if isinstance(ele["video"], str):
         video_reader_backend = get_video_reader_backend()
+        # decord 对 webm/VP9 支持不完善，直接走 torchvision 避免无谓的失败重试
+        if video_reader_backend == "decord" and ele["video"].lower().endswith(".webm"):
+            video_reader_backend = "torchvision"
         try:
             video, video_metadata, sample_fps = VIDEO_READER_BACKENDS[video_reader_backend](ele)
         except Exception as e:
