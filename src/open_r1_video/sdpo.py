@@ -403,6 +403,14 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
             training_args.model_init_kwargs = {}
         training_args.model_init_kwargs["torch_dtype"] = model_args.torch_dtype
 
+    # 收集并保存训练配置到输出目录
+    run_config = _collect_run_config(script_args, training_args, model_args)
+    if training_args.local_rank in (-1, 0):
+        config_save_path = os.path.join(training_args.output_dir, "training_config.json")
+        with open(config_save_path, "w", encoding="utf-8") as f:
+            json.dump(run_config, f, ensure_ascii=False, indent=2)
+        print(f"Training config saved to: {config_save_path}")
+
     trainer = Qwen2VLSDPOTrainer(
         model=model_args.model_name_or_path,
         args=training_args,
@@ -417,7 +425,7 @@ def main(script_args: SDPOScriptArguments, training_args: SDPOConfig, model_args
         attn_implementation=model_args.attn_implementation,
         use_fixed_teacher=script_args.use_fixed_teacher,
         teacher_model_path=script_args.teacher_model_path,
-        callbacks=[_SwanLabConfigCallback(_collect_run_config(script_args, training_args, model_args))],
+        callbacks=[_SwanLabConfigCallback(run_config)],
     )
     
     print("\nStarting training...")

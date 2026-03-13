@@ -27,7 +27,9 @@ On-Policy Self-Distillation (SDPO) Trainer
 """
 
 import copy
+import json
 import os
+import re
 import textwrap
 from collections import defaultdict
 from typing import Any, Optional, Union
@@ -508,6 +510,13 @@ class Qwen2VLSDPOTrainer(Trainer):
 
         # 禁用损失相关的 kwargs 检查，因为我们自定义了损失计算
         self.model_accepts_loss_kwargs = False
+
+        # 初始化训练样本日志文件路径
+        rank = self.accelerator.process_index
+        self._training_log_path = os.path.join(args.output_dir, f"training_log_rank{rank}.jsonl")
+        os.makedirs(args.output_dir, exist_ok=True)
+        with open(self._training_log_path, "w"):
+            pass  # 清空文件，每次训练重新开始记录
 
         # 将固定教师模型注册进 DeepSpeed / Accelerate，确保 ZeRO-3 下参数分片和聚合 hooks 一致
         if self._fixed_teacher_model is not None:
@@ -1217,6 +1226,14 @@ class Qwen2VLSDPOTrainer(Trainer):
             self.accelerator.gather_for_metrics(mean_kl_divergence).mean().item()
         )
 
+        # ==================== 步骤 10: 记录训练样本详情 ====================
+        self._log_training_samples(
+            raw_inputs=pb.raw_inputs,
+            completion_only_ids=completion_only_ids,
+            kl_per_token=kl_per_token,
+            completion_mask=completion_mask,
+        )
+
         return loss
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
@@ -1232,6 +1249,111 @@ class Qwen2VLSDPOTrainer(Trainer):
         else:
             super().log(logs)
         self._metrics.clear()
+
+    @staticmethod
+    def _parse_question_options(text: str):
+        """
+        从问题文本中解析出题干和选项
+
+        支持 "A. xxx\\nB. xxx" 格式的选项解析。
+
+        参数:
+            text: 包含问题和选项的原始文本
+
+        返回:
+            (question, options): 题干字符串和选项字典 {"A": "...", "B": "...", ...}
+        """
+        if not text:
+            return "", {}
+
+        # 截断可能的 ponder marker
+        _ponder_marker = "Please think about this question as if you were a human pondering deeply"
+        if _ponder_marker in text:
+            text = text[:text.index(_ponder_marker)].rstrip()
+
+        # 按选项标记（如 "\nA."）分割
+        parts = re.split(r'\n(?=[A-E]\.)', text)
+        if len(parts) <= 1:
+            return text.strip(), {}
+
+        question = parts[0].strip()
+        options = {}
+        for part in parts[1:]:
+            part = part.strip()
+            if part and len(part) >= 2 and part[0] in "ABCDE" and part[1] == ".":
+                options[part[0]] = part[2:].strip()
+
+        return question, options
+
+    def _log_training_samples(
+        self,
+        raw_inputs: list,
+        completion_only_ids: torch.Tensor,
+        kl_per_token: torch.Tensor,
+        completion_mask: torch.Tensor,
+    ):
+        """
+        记录训练样本的详细信息到 JSONL 文件
+
+        每条记录包含：样本 ID、问题、选项、视频路径、学生模型回答、
+        回答长度、平均 KL 散度、每个 token 的 KL 散度值以及对应的 token 文本。
+
+        分布式训练时每个 rank 写入独立文件（training_log_rank{N}.jsonl），
+        合并后即可得到完整训练数据集的记录。
+
+        参数:
+            raw_inputs: 原始 batch 数据（list[dict]），包含 conversations、video、id 等字段
+            completion_only_ids: 生成的 completion token IDs (B, L)
+            kl_per_token: 每个 token 的 KL 散度值 (B, L)，已乘以 completion_mask
+            completion_mask: 有效 token 掩码 (B, L)，EOS 及之前为 1，之后为 0
+        """
+        _tokenizer = getattr(self.processing_class, "tokenizer", self.processing_class)
+
+        # 将 tensor 移至 CPU（detach 不影响计算图）
+        comp_ids_cpu = completion_only_ids.detach().cpu()
+        kl_cpu = kl_per_token.detach().cpu()
+        mask_cpu = completion_mask.detach().cpu()
+
+        records = []
+        for i in range(comp_ids_cpu.size(0)):
+            sample = raw_inputs[i]
+            valid_len = int(mask_cpu[i].sum().item())
+
+            # 解码学生模型回答
+            valid_ids = comp_ids_cpu[i, :valid_len].tolist()
+            student_answer = _tokenizer.decode(valid_ids, skip_special_tokens=True)
+
+            # 解码每个 token（用于与 per-token KL 对照分析）
+            tokens = _tokenizer.convert_ids_to_tokens(valid_ids)
+
+            # 提取问题和选项
+            conversations = sample.get("conversations", [])
+            raw_question = conversations[0]["value"] if conversations else ""
+            question, options = self._parse_question_options(raw_question)
+
+            # Per-token KL 散度
+            sample_kl = kl_cpu[i, :valid_len].tolist()
+
+            # 平均 KL 散度
+            mean_kl = float(kl_cpu[i].sum().item() / max(valid_len, 1))
+
+            record = {
+                "global_step": self.state.global_step,
+                "sample_id": sample.get("id", ""),
+                "question": question,
+                "options": options,
+                "video_path": sample.get("video", ""),
+                "student_answer": student_answer,
+                "completion_length": valid_len,
+                "mean_kl_divergence": mean_kl,
+                "kl_per_token": sample_kl,
+                "tokens": tokens,
+            }
+            records.append(record)
+
+        with open(self._training_log_path, "a", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def create_model_card(
         self,

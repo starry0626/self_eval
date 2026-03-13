@@ -94,6 +94,8 @@ def parse_args() -> argparse.Namespace:
                         help="vLLM 最大序列长度（None 表示使用模型默认值）")
     parser.add_argument("--vllm_batch_size", type=int, default=16,
                         help="vLLM 批量推理时每批样本数")
+    parser.add_argument("--vllm_prefetch", action="store_true", default=False,
+                        help="启用后台线程预取：在 GPU 推理当前 batch 时，后台线程预处理下一个 batch 的视频")
 
     return parser.parse_args()
 
@@ -466,29 +468,44 @@ def main():
     inference_times = []
 
     if args.use_vllm:
-        # ---- vLLM 流水线推理路径 ----
-        # 后台线程预处理 chunk N+1 的视频，同时主线程对 chunk N 进行 GPU 推理
-        # 类似训练脚本 BatchPrefetcher 的生产者-消费者模式
+        # ---- vLLM 分块推理路径 ----
         import gc
 
         batch_size = args.vllm_batch_size
         total_samples = len(dataset)
         num_chunks = (total_samples + batch_size - 1) // batch_size
 
-        print(f"\nRunning vLLM pipelined inference: {total_samples} samples, "
-              f"batch_size={batch_size}, {num_chunks} chunks (prefetch=1)")
+        if args.vllm_prefetch:
+            mode_desc = "pipelined (prefetch=1)"
+        else:
+            mode_desc = "chunked (sequential)"
+        print(f"\nRunning vLLM {mode_desc} inference: {total_samples} samples, "
+              f"batch_size={batch_size}, {num_chunks} chunks")
 
         t_total_start = time.time()
         total_inferred = 0
 
-        prefetcher = _prefetch_chunks(
-            dataset, batch_size, build_messages, processor,
-            args.video_base_dir, args.fps, args.max_frames,
-            args.max_pixels, args.answer_mode,
-        )
+        if args.vllm_prefetch:
+            # 后台线程预处理 chunk N+1，同时主线程对 chunk N 进行 GPU 推理
+            chunk_iter = _prefetch_chunks(
+                dataset, batch_size, build_messages, processor,
+                args.video_base_dir, args.fps, args.max_frames,
+                args.max_pixels, args.answer_mode,
+            )
+        else:
+            # 串行：预处理完当前 chunk 后再推理
+            chunk_iter = (
+                _preprocess_chunk(
+                    dataset[start : start + batch_size],
+                    build_messages, processor,
+                    args.video_base_dir, args.fps, args.max_frames,
+                    args.max_pixels, args.answer_mode,
+                )
+                for start in range(0, total_samples, batch_size)
+            )
 
         for chunk_inputs, chunk_meta, error_results in tqdm(
-            prefetcher, desc="vLLM inference", total=num_chunks
+            chunk_iter, desc="vLLM inference", total=num_chunks
         ):
             # 收集预处理阶段的错误
             results.extend(error_results)

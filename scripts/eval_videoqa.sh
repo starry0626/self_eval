@@ -59,6 +59,8 @@ GPU_MEMORY_UTILIZATION=0.80
 MAX_MODEL_LEN=
 # vLLM 每批推理样本数
 VLLM_BATCH_SIZE=16
+# 启用后台预取：GPU 推理当前 batch 时预处理下一个 batch 的视频（true/留空）
+VLLM_PREFETCH=true
 
 # ================= 构建可选参数 =================
 OPTIONAL_ARGS=""
@@ -76,6 +78,9 @@ if [ "$USE_VLLM" = "true" ]; then
     OPTIONAL_ARGS="$OPTIONAL_ARGS --tensor_parallel_size $TENSOR_PARALLEL_SIZE"
     OPTIONAL_ARGS="$OPTIONAL_ARGS --gpu_memory_utilization $GPU_MEMORY_UTILIZATION"
     OPTIONAL_ARGS="$OPTIONAL_ARGS --vllm_batch_size $VLLM_BATCH_SIZE"
+    if [ "$VLLM_PREFETCH" = "true" ]; then
+        OPTIONAL_ARGS="$OPTIONAL_ARGS --vllm_prefetch"
+    fi
     if [ -n "$MAX_MODEL_LEN" ]; then
         OPTIONAL_ARGS="$OPTIONAL_ARGS --max_model_len $MAX_MODEL_LEN"
     fi
@@ -96,6 +101,7 @@ echo "  张量并行:   $TENSOR_PARALLEL_SIZE"
 echo "  显存利用率: $GPU_MEMORY_UTILIZATION"
 echo "  最大序列长度: $MAX_MODEL_LEN"
 echo "  批量大小:   $VLLM_BATCH_SIZE"
+echo "  后台预取:   $VLLM_PREFETCH"
 else
 echo "  推理后端:   HuggingFace Transformers"
 fi
