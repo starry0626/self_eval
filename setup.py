@@ -65,7 +65,8 @@ _deps = [
     "trl",
     "vllm==0.6.6.post1",
     "pillow",
-    'swanlab'
+    'swanlab',
+    "decord"
 ]
 
 # this is a lookup table with items like:

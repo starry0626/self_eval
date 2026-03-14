@@ -292,12 +292,13 @@ def _preprocess_chunk(
         (vllm_inputs, chunk_meta, error_results) 三元组
     """
     chunk_inputs = []
-    chunk_meta = []   # list of (sample_id, gt_answer, problem_type)
+    chunk_meta = []   # list of (sample_id, gt_answer, problem_type, video_path)
     error_results = []
 
     for sample in chunk_samples:
         problem_type = sample.get("problem_type", "multiple choice")
         sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+        video_path = sample.get("path", "")
         gt_answer = ""
 
         try:
@@ -311,7 +312,7 @@ def _preprocess_chunk(
             )
             vllm_input = prepare_vllm_input(processor, messages, answer_mode)
             chunk_inputs.append(vllm_input)
-            chunk_meta.append((sample_id, gt_answer, problem_type))
+            chunk_meta.append((sample_id, gt_answer, problem_type, video_path))
         except Exception as e:
             import traceback
             print(f"\n Error preparing sample {sample_id}: {e}")
@@ -324,6 +325,7 @@ def _preprocess_chunk(
                 "correct": 0.0,
                 "response": f"ERROR: {e}",
                 "inference_time": 0.0,
+                "video_path": video_path,
             })
 
     return chunk_inputs, chunk_meta, error_results
@@ -515,7 +517,7 @@ def main():
                 total_inferred += len(chunk_responses)
 
                 for j, response in enumerate(chunk_responses):
-                    sample_id, gt_answer, problem_type = chunk_meta[j]
+                    sample_id, gt_answer, problem_type, video_path = chunk_meta[j]
                     pred_answer = extract_pred_answer(response, args.answer_mode, problem_type)
                     correct = compute_accuracy(pred_answer, gt_answer, problem_type)
                     results.append({
@@ -525,6 +527,7 @@ def main():
                         "prediction": pred_answer,
                         "correct": correct,
                         "response": response,
+                        "video_path": video_path,
                     })
 
             # 释放当前 chunk 的视频数据，防止内存堆积
@@ -546,6 +549,7 @@ def main():
             t0 = time.time()
             problem_type = sample.get("problem_type", "multiple choice")
             sample_id = str(sample.get("problem_id", sample.get("video_id", "")))
+            video_path = sample.get("path", "")
             gt_answer = ""
 
             try:
@@ -573,6 +577,7 @@ def main():
                     "correct": correct,
                     "response": response,
                     "inference_time": elapsed,
+                    "video_path": video_path,
                 })
 
             except Exception as e:
@@ -587,6 +592,7 @@ def main():
                     "correct": 0.0,
                     "response": f"ERROR: {e}",
                     "inference_time": time.time() - t0,
+                    "video_path": video_path,
                 })
 
     # 统计
