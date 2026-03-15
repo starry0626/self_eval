@@ -1,10 +1,12 @@
 """
-分析旧版 results.json 中 prediction 为空（未提取到答案）的样本
+分析 results.json 中 prediction 为空（未提取到答案）的样本
 
 功能：
   1. 统计 prediction 为空的样本数量
-  2. 从原始数据集中查找对应的视频路径，补充到记录中
+  2. 从原始数据集中查找对应的视频路径、问题、选项，补充到记录中
   3. 将这些样本单独写入 no_answer_samples.json
+  4. (可选) --export_dataset: 从原始数据集中提取对应条目，
+     生成可直接用于重新测试的数据集 JSON 文件
 
 使用方法：
     python scripts/analyze_no_answer.py results.json
@@ -14,6 +16,10 @@
 
     # 指定输出文件路径（默认为 results.json 同目录下的 no_answer_samples.json）
     python scripts/analyze_no_answer.py results.json -o output.json
+
+    # 导出可重新测试的数据集子集
+    python scripts/analyze_no_answer.py results.json --dataset_path path/to/eval_xxx.json --export_dataset
+    python scripts/analyze_no_answer.py results.json --dataset_path path/to/eval_xxx.json --export_dataset --export_path retest.json
 """
 
 import argparse
@@ -33,6 +39,10 @@ def main():
                         help="原始数据集 JSON 路径（默认从 summary.dataset_path 读取）")
     parser.add_argument("-o", "--output", type=str, default=None,
                         help="输出文件路径（默认为同目录下 no_answer_samples.json）")
+    parser.add_argument("--export_dataset", action="store_true", default=False,
+                        help="从原始数据集中提取无答案样本，生成可重新测试的数据集 JSON")
+    parser.add_argument("--export_path", type=str, default=None,
+                        help="导出数据集的路径（默认为同目录下 eval_<type>_no_answer.json）")
     args = parser.parse_args()
 
     # 读取 results.json
@@ -136,6 +146,29 @@ def main():
         response_preview = r.get("response", "")[:80] + "..." if len(r.get("response", "")) > 80 else r.get("response", "")
         print(f"  [{i+1}] id={r.get('id', 'N/A')}, gt={r.get('ground_truth', 'N/A')}, video={video}")
         print(f"       response: {response_preview}")
+
+    # 导出可重新测试的数据集子集
+    if args.export_dataset:
+        if not id_to_sample:
+            print("\nError: 需要原始数据集才能导出，请通过 --dataset_path 指定")
+            sys.exit(1)
+
+        no_answer_ids = {str(r.get("id", "")) for r in no_answer}
+        export_samples = [
+            id_to_sample[sid] for sid in no_answer_ids if sid in id_to_sample
+        ]
+
+        if not export_samples:
+            print("\nWarning: 未能从数据集中匹配到任何无答案样本，跳过导出")
+        else:
+            dataset_type = summary.get("dataset_type", "unknown")
+            export_path = (
+                Path(args.export_path) if args.export_path
+                else results_path.parent / f"eval_{dataset_type}_no_answer.json"
+            )
+            with open(export_path, "w", encoding="utf-8") as f:
+                json.dump(export_samples, f, indent=2, ensure_ascii=False)
+            print(f"\n已导出 {len(export_samples)} 条数据集记录用于重新测试: {export_path}")
 
 
 if __name__ == "__main__":
