@@ -83,6 +83,20 @@ def parse_args() -> argparse.Namespace:
                         choices=["bfloat16", "float16", "float32"],
                         help="模型加载精度")
 
+    # ---- 采样参数配置（Qwen3-VL-Thinking 官方推荐） ----
+    parser.add_argument("--greedy", action="store_true", default=False,
+                        help="使用贪心解码（默认关闭，即使用采样）")
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="采样温度（1.0=不缩放原始分布）")
+    parser.add_argument("--top_p", type=float, default=0.95,
+                        help="核采样阈值（只从累积概率达 top_p 的 token 中采样）")
+    parser.add_argument("--top_k", type=int, default=20,
+                        help="Top-K 采样（每步只从概率最高的 K 个 token 中采样）")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0,
+                        help="重复惩罚系数（1.0=不惩罚）")
+    parser.add_argument("--presence_penalty", type=float, default=0.0,
+                        help="存在惩罚系数（0.0=不惩罚，vLLM 专用）")
+
     # ---- vLLM 推理配置 ----
     parser.add_argument("--use_vllm", action="store_true", default=False,
                         help="使用 vLLM 进行推理（离线批量推理，速度更快）")
@@ -178,6 +192,11 @@ def run_inference(
     messages: list,
     max_new_tokens: int,
     answer_mode: str = "think",
+    greedy: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    repetition_penalty: float = 1.0,
 ) -> str:
     """对单个样本运行推理，返回模型生成的文本（已去除输入部分）"""
     from qwen_vl_utils import process_vision_info
@@ -205,11 +224,20 @@ def run_inference(
     )
     inputs = inputs.to(model.device)
 
+    generate_kwargs = dict(max_new_tokens=max_new_tokens)
+    if greedy:
+        generate_kwargs["do_sample"] = False
+    else:
+        generate_kwargs["do_sample"] = True
+        generate_kwargs["temperature"] = temperature
+        generate_kwargs["top_p"] = top_p
+        generate_kwargs["top_k"] = top_k
+        generate_kwargs["repetition_penalty"] = repetition_penalty
+
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
+            **generate_kwargs,
         )
 
     generated_ids_trimmed = generated_ids[:, inputs.input_ids.shape[1]:]
@@ -263,14 +291,30 @@ def run_vllm_batch_inference(
     llm,
     vllm_inputs: list,
     max_new_tokens: int,
+    greedy: bool = False,
+    temperature: float = 1.0,
+    top_p: float = 0.95,
+    top_k: int = 20,
+    repetition_penalty: float = 1.0,
+    presence_penalty: float = 0.0,
 ) -> list:
     """使用 vLLM 对一批样本进行离线推理，返回生成文本列表"""
     from vllm import SamplingParams
 
-    sampling_params = SamplingParams(
-        temperature=0,
-        max_tokens=max_new_tokens,
-    )
+    if greedy:
+        sampling_params = SamplingParams(
+            temperature=0,
+            max_tokens=max_new_tokens,
+        )
+    else:
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+            presence_penalty=presence_penalty,
+            max_tokens=max_new_tokens,
+        )
 
     outputs = llm.generate(vllm_inputs, sampling_params=sampling_params)
     return [output.outputs[0].text for output in outputs]
@@ -513,7 +557,15 @@ def main():
             results.extend(error_results)
 
             if chunk_inputs:
-                chunk_responses = run_vllm_batch_inference(llm, chunk_inputs, args.max_new_tokens)
+                chunk_responses = run_vllm_batch_inference(
+                    llm, chunk_inputs, args.max_new_tokens,
+                    greedy=args.greedy,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    repetition_penalty=args.repetition_penalty,
+                    presence_penalty=args.presence_penalty,
+                )
                 total_inferred += len(chunk_responses)
 
                 for j, response in enumerate(chunk_responses):
@@ -562,7 +614,14 @@ def main():
                     answer_mode=args.answer_mode,
                 )
 
-                response = run_inference(model, processor, messages, args.max_new_tokens, args.answer_mode)
+                response = run_inference(
+                    model, processor, messages, args.max_new_tokens, args.answer_mode,
+                    greedy=args.greedy,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    top_k=args.top_k,
+                    repetition_penalty=args.repetition_penalty,
+                )
                 pred_answer = extract_pred_answer(response, args.answer_mode, problem_type)
                 correct = compute_accuracy(pred_answer, gt_answer, problem_type)
 

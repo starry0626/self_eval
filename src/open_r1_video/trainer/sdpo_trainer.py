@@ -60,7 +60,13 @@ from trl.trainer.grpo_config import GRPOConfig
 from trl.trainer.utils import generate_model_card, get_comet_experiment_url
 
 from qwen_vl_utils import process_vision_info
-from .teacher_context_builder import TeacherContextBuilder, TeacherContextConfig
+from .teacher_context_builder import (
+    TeacherContextBuilder, TeacherContextConfig,
+    extract_answer_from_conversation,
+    extract_reasoning_from_conversation,
+    extract_temporal_grounding_text,
+    compute_temporal_video_frame_timestamps,
+)
 from .divergence import DivergenceConfig, compute_reverse_kl
 
 if is_peft_available():
@@ -1331,6 +1337,39 @@ class Qwen2VLSDPOTrainer(Trainer):
             raw_question = conversations[0]["value"] if conversations else ""
             question, options = self._parse_question_options(raw_question)
 
+            # 提取正确答案
+            answer_text, answer_letter = extract_answer_from_conversation(conversations)
+            correct_answer = answer_letter
+            if answer_letter and answer_letter in options:
+                correct_answer_text = f"{answer_letter}. {options[answer_letter]}"
+            else:
+                correct_answer_text = answer_text
+
+            # 构建 teacher_extra_info
+            teacher_extra_info = {}
+            cfg = self.teacher_context_builder.config
+            if cfg.include_answer and answer_text:
+                teacher_extra_info["answer"] = correct_answer_text
+
+            temporal_grounding = sample.get("temporal_grounding")
+
+            if cfg.include_temporal_text and temporal_grounding:
+                temporal_text = extract_temporal_grounding_text(temporal_grounding)
+                if temporal_text:
+                    teacher_extra_info["temporal_text"] = temporal_text
+
+            if cfg.include_reasoning:
+                reasoning = extract_reasoning_from_conversation(conversations)
+                if reasoning:
+                    teacher_extra_info["reasoning"] = reasoning
+
+            if cfg.include_temporal_video and temporal_grounding:
+                temporal_frames = compute_temporal_video_frame_timestamps(
+                    temporal_grounding, cfg
+                )
+                if temporal_frames:
+                    teacher_extra_info["temporal_video_frames"] = temporal_frames
+
             # Per-token KL 散度
             sample_kl = kl_cpu[i, :valid_len].tolist()
 
@@ -1343,6 +1382,9 @@ class Qwen2VLSDPOTrainer(Trainer):
                 "question": question,
                 "options": options,
                 "video_path": sample.get("video", ""),
+                "correct_answer": correct_answer,
+                "correct_answer_text": correct_answer_text,
+                "teacher_extra_info": teacher_extra_info,
                 "student_answer": student_answer,
                 "completion_length": valid_len,
                 "mean_kl_divergence": mean_kl,

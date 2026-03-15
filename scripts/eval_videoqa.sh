@@ -48,6 +48,20 @@ MAX_NEW_TOKENS=1024
 ATTN_IMPLEMENTATION=flash_attention_2
 TORCH_DTYPE=bfloat16
 
+# ================= 采样参数配置（Qwen3-VL-Thinking 官方推荐） =================
+# 是否使用贪心解码（false=采样, true=贪心）
+GREEDY=false
+# 温度系数（1.0=不缩放原始分布）
+TEMPERATURE=1.0
+# 核采样阈值（只从累积概率达 top_p 的 token 中采样）
+TOP_P=0.95
+# Top-K 采样（每步只从概率最高的 K 个 token 中采样）
+TOP_K=20
+# 重复惩罚（1.0=不惩罚）
+REPETITION_PENALTY=1.0
+# 存在惩罚（0.0=不惩罚，vLLM 专用）
+PRESENCE_PENALTY=0.0
+
 # ================= vLLM 推理配置 =================
 # 设置为 true 启用 vLLM 离线批量推理（速度更快）
 USE_VLLM=true
@@ -86,6 +100,16 @@ if [ "$USE_VLLM" = "true" ]; then
     fi
 fi
 
+# ---- 采样参数 ----
+if [ "$GREEDY" = "true" ]; then
+    OPTIONAL_ARGS="$OPTIONAL_ARGS --greedy"
+fi
+OPTIONAL_ARGS="$OPTIONAL_ARGS --temperature $TEMPERATURE"
+OPTIONAL_ARGS="$OPTIONAL_ARGS --top_p $TOP_P"
+OPTIONAL_ARGS="$OPTIONAL_ARGS --top_k $TOP_K"
+OPTIONAL_ARGS="$OPTIONAL_ARGS --repetition_penalty $REPETITION_PENALTY"
+OPTIONAL_ARGS="$OPTIONAL_ARGS --presence_penalty $PRESENCE_PENALTY"
+
 # ================= 打印启动信息 =================
 echo "=========================================="
 echo "  VideoQA 评估"
@@ -95,6 +119,8 @@ echo "  数据集:     $DATASET_TYPE"
 echo "  数据集路径: $DATASET_PATH"
 echo "  回答模式:   $ANSWER_MODE"
 echo "  输出:       $OUTPUT_DIR"
+echo "  采样配置:   greedy=$GREEDY temperature=$TEMPERATURE top_p=$TOP_P top_k=$TOP_K"
+echo "              repetition_penalty=$REPETITION_PENALTY presence_penalty=$PRESENCE_PENALTY"
 if [ "$USE_VLLM" = "true" ]; then
 echo "  推理后端:   vLLM"
 echo "  张量并行:   $TENSOR_PARALLEL_SIZE"

@@ -336,6 +336,87 @@ def sample_temporal_video_segments(
     return video_segments
 
 
+def compute_temporal_video_frame_timestamps(
+    temporal_grounding: Dict[str, str],
+    config: TeacherContextConfig,
+) -> List[Dict[str, Any]]:
+    """
+    计算 temporal_grounding 各片段的帧时间戳（仅计算时间，不读取视频文件）
+
+    复用 sample_temporal_video_segments 的规划与等比例缩减逻辑，
+    但第三步仅用 np.linspace 计算时间戳，不调用 cv2 采样帧。
+
+    参数:
+        temporal_grounding: 时间定位字典，格式为 {"00:20-00:48": "描述", ...}
+        config: 教师上下文配置
+
+    返回:
+        segments: 每个片段的元信息列表，格式为
+            [{segment, description, is_point, num_frames, frame_timestamps}, ...]
+    """
+    if not temporal_grounding:
+        return []
+
+    # ==================== 第一遍：规划每个片段的采样帧数 ====================
+    plan = []
+    for timestamp, description in temporal_grounding.items():
+        if description is None:
+            continue
+        if len(plan) >= config.max_temporal_segments:
+            break
+
+        start_time, end_time = parse_timestamp(timestamp)
+        is_point = (start_time == end_time)
+
+        if is_point:
+            num_frames = config.point_frames_count
+        else:
+            duration = end_time - start_time
+            desired_frames = max(1, int(duration * config.temporal_fps))
+            num_frames = min(desired_frames, config.temporal_max_frames)
+
+        plan.append({
+            "timestamp": timestamp,
+            "description": description,
+            "start_time": start_time,
+            "end_time": end_time,
+            "is_point": is_point,
+            "num_frames": num_frames,
+        })
+
+    # ==================== 等比例降低：总帧数超限时缩减 ====================
+    if config.max_total_extra_frames is not None and plan:
+        total_frames = sum(s["num_frames"] for s in plan)
+        if total_frames > config.max_total_extra_frames:
+            ratio = config.max_total_extra_frames / total_frames
+            for s in plan:
+                s["num_frames"] = max(1, int(s["num_frames"] * ratio))
+
+    # ==================== 第三遍：仅计算时间戳 ====================
+    segments = []
+    for s in plan:
+        if s["is_point"]:
+            center_time = s["start_time"]
+            actual_start = max(0, center_time - config.point_frames_range)
+            actual_end = center_time + config.point_frames_range
+            frame_timestamps = np.linspace(actual_start, actual_end, s["num_frames"]).tolist()
+        else:
+            if s["start_time"] == s["end_time"]:
+                frame_timestamps = [s["start_time"]]
+            else:
+                frame_timestamps = np.linspace(s["start_time"], s["end_time"], s["num_frames"]).tolist()
+
+        segments.append({
+            "segment": s["timestamp"],
+            "description": s["description"],
+            "is_point": s["is_point"],
+            "num_frames": s["num_frames"],
+            "frame_timestamps": [round(t, 2) for t in frame_timestamps],
+        })
+
+    return segments
+
+
 def build_teacher_prompt(
     original_prompt_messages: List[Dict],
     config: TeacherContextConfig,
