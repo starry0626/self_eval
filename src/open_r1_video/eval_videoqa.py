@@ -479,6 +479,15 @@ def main():
     print(f"  路径预检查:    {args.check_video_paths}")
     print("=" * 60)
 
+    # 将全部评估参数保存到输出目录
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    eval_config = vars(args)
+    config_path = output_dir / "eval_config.json"
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(eval_config, f, indent=2, ensure_ascii=False)
+    print(f"\n✓ 评估参数已保存到 {config_path}")
+
     # 加载数据集（在模型之前加载，以便预检查路径）
     print(f"\nLoading dataset from {args.dataset_path} ...")
     with open(args.dataset_path, "r", encoding="utf-8") as f:
@@ -673,7 +682,6 @@ def main():
 
     # 保存结果
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     summary = {
         "model_path": args.model_path,
